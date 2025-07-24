@@ -37,9 +37,9 @@ fn main() -> std::io::Result<()> {
     for f in files_to_parse {
         // TODO: This can be parallelized per file
 
-        let mut parsed_file = FTDCFileDecoder::new();
+        let mut file_parser = FTDCFileDecoder::new();
 
-        let result = parsed_file.read_file(&*f);
+        let result = file_parser.read_file(&*f);
         match result {
             Ok(parsed_file) => {
                 //parsed_file.write_parquet(&*f).expect("TODO: panic message");
