@@ -1,5 +1,5 @@
 use clap::Parser;
-use ftdc::{OutputFormat, ParsedFile};
+use ftdc::{FTDCFileDecoder, OutputFormat};
 use std::fs;
 use std::path::Path;
 
@@ -17,12 +17,10 @@ struct Args {
 }
 
 fn main() -> std::io::Result<()> {
-
     env_logger::init();
 
     let args = Args::parse();
     let mut files_to_parse: Vec<String> = Vec::new();
-
 
     // Is this a directory?
     let path_directory = Path::new(&args.path);
@@ -39,13 +37,13 @@ fn main() -> std::io::Result<()> {
     for f in files_to_parse {
         // TODO: This can be parallelized per file
 
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
 
         let result = parsed_file.read_file(&*f);
         match result {
             Ok(parsed_file) => {
                 //parsed_file.write_parquet(&*f).expect("TODO: panic message");
-            },
+            }
             Err(error) => {
                 println!("{error:?}")
             }

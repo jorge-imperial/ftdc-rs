@@ -1,29 +1,19 @@
 use std::error::Error;
-use std::fmt::{Display, Formatter};
+use thiserror::Error;
 
 /// Enumerates
-#[derive(Debug)]
-pub enum FileParserError {
+#[derive(Debug, Error)]
+
+pub enum FileDecoderError {
+    #[error("{0}")]
     FileIOError(std::io::Error),
-    Other(Box::<dyn Error>, String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
-#[derive(Debug)]
-pub  struct FTDCDecodeError {
-    pub  message: String,
-    pub  source: Option<Box<dyn Error>>,
-}
-
-
-impl Display for FTDCDecodeError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FTDC decode error")
-    }
-}
-
-impl Error for FTDCDecodeError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_deref()
-    }
-
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct FTDCDecodeError {
+    pub message: String,
+    pub source: Option<anyhow::Error>,
 }

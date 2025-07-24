@@ -1,19 +1,18 @@
+extern crate core;
 mod errors;
 
-extern crate core;
-
+use anyhow::anyhow;
 use bson::{Binary, Bson, Document};
 use buffered_reader;
 use buffered_reader::BufferedReader;
 use integer_encoding::*;
-use zune_inflate::errors::InflateDecodeErrors;
 use zune_inflate::DeflateDecoder;
+use zune_inflate::errors::InflateDecodeErrors;
 
-use crate::errors::FTDCDecodeError;
-use crate::errors::FileParserError;
+use crate::errors::FileDecoderError;
 
 use polars::prelude::*;
-
+use thiserror::__private::AsDynError;
 
 #[derive(Debug, Clone)]
 pub enum OutputFormat {
@@ -21,18 +20,18 @@ pub enum OutputFormat {
     Parquet,
 }
 
-/// A structure that holds parsed info for a file.
-pub struct ParsedFile {
+/// A struct that de codes an FTDC file.
+/// The parsed data should be encapsulated in another struct.
+pub struct FTDCFileDecoder {
     metadata: String,
     parameters: String,
-    
+
     metric_chunks_count: usize,
     binary_chunks: Vec<Binary>,
-    
+
     metrics_in_chunks: usize,
     total_samples: usize,
 }
-
 
 #[derive(Debug)]
 pub struct MetricMetaData {
@@ -42,13 +41,13 @@ pub struct MetricMetaData {
 }
 
 #[derive(Debug)]
-pub struct MetricData  {
+pub struct MetricData {
     pub meta_data: MetricMetaData,
-    pub data: [u64; ParsedFile::MAX_METRICS],//& 'a [u64],
+    pub data: [u64; FTDCFileDecoder::MAX_METRICS],
     pub metrics: usize,
 }
 
-impl ParsedFile {
+impl FTDCFileDecoder {
     const METADATA: i32 = 0;
     const METRICS: i32 = 1;
     const PARAMETERS: i32 = 2;
@@ -83,17 +82,16 @@ impl ParsedFile {
         // as u32.
         match decoder.decode_zlib() {
             Ok(encoded_data) => Ok(encoded_data),
-            Err(e) => {
-                return Err(e);
-            }
+            Err(e) => Err(e),
         }
     }
 
     pub fn uncompress_data(&mut self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
-        let mut uncompressed_data_vector: Vec<Vec<u8>> = Vec::with_capacity(self.metric_chunks_count);
+        let mut uncompressed_data_vector: Vec<Vec<u8>> =
+            Vec::with_capacity(self.metric_chunks_count);
 
         for b in self.binary_chunks.iter_mut() {
-            let blob = ParsedFile::inflate_blob(&mut *b);
+            let blob = FTDCFileDecoder::inflate_blob(&mut *b);
 
             match blob {
                 Ok(encoded_data) => {
@@ -129,6 +127,7 @@ impl ParsedFile {
     }
 
     /// Reads sub-docs from the original BSON doc recursively.
+    /// This is a bad name for the function.
     fn get_docs(doc_name: &str, root: Document, metric_data: &mut Vec<MetricMetaData>) {
         for (k, doc) in root {
             match doc {
@@ -151,7 +150,7 @@ impl ParsedFile {
 
                         match a {
                             Bson::Document(doc) => {
-                                ParsedFile::get_docs(&n, doc, metric_data);
+                                FTDCFileDecoder::get_docs(&n, doc, metric_data);
                             }
                             _ => {}
                         }
@@ -161,7 +160,7 @@ impl ParsedFile {
                 }
                 Bson::Document(sub_doc) => {
                     let n = format!("{doc_name}.{}", k.to_string());
-                    ParsedFile::get_docs(&n, sub_doc, metric_data);
+                    FTDCFileDecoder::get_docs(&n, sub_doc, metric_data);
                 }
                 Bson::Boolean(v) => {
                     metric_data.push(MetricMetaData {
@@ -243,9 +242,9 @@ impl ParsedFile {
 
         let root = bson_doc.unwrap();
 
-        ParsedFile::get_docs("", root, &mut ret_metrics);
+        FTDCFileDecoder::get_docs("", root, &mut ret_metrics);
 
-        return ret_metrics;
+        ret_metrics
     }
 
     /// Converts an array of u8 to a vector of vectors of u64 deltas that will be used to construct
@@ -253,11 +252,11 @@ impl ParsedFile {
     ///
     fn get_metric_deltas_from_buffer(buffer: &Vec<u8>) -> Option<Vec<u64>> {
         let base = buffer.as_slice();
-        let (data_size, metric_count, delta_count) = ParsedFile::read_header(buffer.as_slice());
+        let (data_size, metric_count, delta_count) =
+            FTDCFileDecoder::read_header(buffer.as_slice());
 
         // Size of all deltas.
-        let mut metrics_deltas: Vec<u64> =
-            Vec::with_capacity((metric_count * delta_count + 1) as usize);
+        let mut metrics_deltas: Vec<u64> = Vec::with_capacity((metric_count * delta_count + 1));
         // Number of consecutive zeroes.
         let mut num_zeroes: u64 = 0;
         // Last element in buffer.
@@ -319,14 +318,15 @@ impl ParsedFile {
         buffer: &Vec<u8>,
     ) -> Option<Vec<MetricData>> {
         // get deltas
-        let deltas_option = ParsedFile::get_metric_deltas_from_buffer(buffer);
+        let deltas_option = FTDCFileDecoder::get_metric_deltas_from_buffer(buffer);
         if deltas_option.is_none() {
             return None;
         }
         let deltas = deltas_option.unwrap();
         let deltas_slice = deltas.as_slice();
 
-        let (_data_size, metric_count, delta_count) = ParsedFile::read_header(buffer.as_slice());
+        let (_data_size, metric_count, delta_count) =
+            FTDCFileDecoder::read_header(buffer.as_slice());
 
         assert_eq!(deltas.len(), metric_count * delta_count);
 
@@ -334,14 +334,15 @@ impl ParsedFile {
         let mut metrics: Vec<MetricData> = vec![];
         for i in 0..meta_data.len() {
             let meta = meta_data.get(i).unwrap();
-            let mut data: [u64; ParsedFile::MAX_METRICS] = [0; ParsedFile::MAX_METRICS];
+            let mut data: [u64; FTDCFileDecoder::MAX_METRICS] = [0; FTDCFileDecoder::MAX_METRICS];
             data[0] = meta.initial;
 
             // Evaluation of metrics array is made here
             for j in 1..delta_count {
                 data[j] = data[j - 1];
                 data[j] = deltas_slice[(delta_count * i) + j];
-                data[j] = ParsedFile::add_delta(data[j - 1], deltas_slice[(delta_count * i) + j]);
+                data[j] =
+                    FTDCFileDecoder::add_delta(data[j - 1], deltas_slice[(delta_count * i) + j]);
             }
 
             metrics.push(MetricData {
@@ -358,8 +359,8 @@ impl ParsedFile {
         Some(metrics)
     }
 
-    pub fn new() -> ParsedFile {
-        ParsedFile {
+    pub fn new() -> FTDCFileDecoder {
+        FTDCFileDecoder {
             metadata: "".to_string(),
             parameters: "".to_string(),
             metric_chunks_count: 0,
@@ -368,58 +369,75 @@ impl ParsedFile {
             total_samples: 0,
         }
     }
-    pub fn read_file(&mut self, file_name: &str) -> Result<(), FileParserError> {
-
+    pub fn read_file(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
         // Open file, get buffed_reader
-        match  buffered_reader::File::open(file_name) {
+        match buffered_reader::File::open(file_name) {
             Ok(mut reader) => {
-
                 loop {
-                    //
+                    // An FTDC file is a series of BSON documents.
+                    // Read them in one by one
                     match Document::from_reader(&mut reader) {
+                        // If it can be read...
                         Ok(metrics) => {
                             if let Some(chunk_type) = metrics.get("type") {
                                 // println!("Chunk type: {}", chunk_type);
-
                                 match chunk_type.as_i32().unwrap() {
-                                    ParsedFile::METADATA => {
+                                    FTDCFileDecoder::METADATA => {
                                         // Doc key is a JSON structure with the host's information.
                                         match metrics.get("doc") {
                                             Some(doc) => {
                                                 self.metadata = doc.to_string();
                                             }
                                             _ => {
-                                                println!("'doc' type not found");
+                                                //println!("'doc' type not found");
+                                                return Err(FileDecoderError::Other(anyhow!(
+                                                    "'doc' key not found in METADATA chunk. "
+                                                )));
                                             }
                                         }
                                     }
-                                    ParsedFile::METRICS => {
+                                    FTDCFileDecoder::METRICS => {
                                         if metrics.contains_key("data") {
                                             if let Bson::Binary(b) = metrics.get("data").unwrap() {
                                                 self.binary_chunks.push(b.clone());
                                             }
+                                        } else {
+                                            //println!("'data' type not found");
+                                            return Err(FileDecoderError::Other(anyhow!(
+                                                "'data' key not found in METRICS chunk. "
+                                            )));
                                         }
                                     }
-                                    ParsedFile::PARAMETERS => {
+                                    FTDCFileDecoder::PARAMETERS => {
                                         // Doc key is a JSON structure with the host's information.
                                         match metrics.get("doc") {
                                             Some(doc) => {
                                                 self.parameters = doc.to_string();
                                             }
                                             _ => {
-                                                println!("doc type not found");
+                                                //println!("doc type not found");
+                                                return Err(FileDecoderError::Other(anyhow!(
+                                                    "'doc' key not found in PARAMETERS chunk. "
+                                                )));
                                             }
                                         }
                                     }
                                     _ => {
-                                        println!("Unknown doc type: {:?}", chunk_type);
+                                        return Err(FileDecoderError::Other(anyhow!(
+                                            "Unknown BSON doc type {chunk_type:?}"
+                                        )));
                                     }
                                 }
+                            } else {
+                                println!("'type' not found");
+                                return Err(FileDecoderError::Other(anyhow!(
+                                    "'type' key not found in chunk. "
+                                )));
                             }
                         }
                         Err(e) => {
                             if !reader.eof() {
-                                println!("Failed to read from file: {}", e);
+                                return Err(FileDecoderError::Other(anyhow!(e)));
                             }
                             break;
                         }
@@ -428,70 +446,65 @@ impl ParsedFile {
                 }
             }
             Err(e) => {
-                return Err( FileParserError::FileIOError(e));
+                // IO errors
+                return Err(FileDecoderError::FileIOError(e));
             }
         }
 
         Ok(())
     }
-    
+
     pub fn get_metrics(&mut self) -> Result<(), &str> {
         match self.uncompress_data() {
             Ok(uncompress_data) => {
-
                 // TODO: Should check that all chunks have the same number of metrics.
                 let mut metric_names: Vec<MetricMetaData> = vec![];
 
                 // Uncompress
                 for chunk in uncompress_data {
-                    
                     // We only need these once.
                     if metric_names.len() == 0 {
-                        metric_names = ParsedFile::get_metric_names(&chunk);
+                        metric_names = FTDCFileDecoder::get_metric_names(&chunk);
                     }
 
                     if let Some(metrics) =
-                        ParsedFile::get_metrics_from_buffer(&metric_names, &chunk) {
+                        FTDCFileDecoder::get_metrics_from_buffer(&metric_names, &chunk)
+                    {
                         println!("{}", metrics.len());
-                        
-                       // for metric in metrics {
-                       //      let series = Series
-                       // }
+
+                        // for metric in metrics {
+                        //      let series = Series
+                        // }
                     }
                 }
-                
+
                 Ok(())
-                 
             }
-            _ => {
-                Err("Fatal: uncompress_data")
-            }
+            _ => Err("Fatal: uncompress_data"),
         }
     }
 
-
-    pub fn write_parquet(&mut self, file_name: &str) -> Result<(), &str> {
+    pub fn write_parquet(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
         match self.uncompress_data() {
             Ok(uncompress_data) => {
-                
                 // TODO: Should check that all chunks have the same number of metrics.
-                let mut metric_names : Vec<MetricMetaData> = vec![]; //  = ParsedFile::get_metric_names(&chunk);
-                
+                let mut metric_names: Vec<MetricMetaData> = vec![]; //  = ParsedFile::get_metric_names(&chunk);
+
                 // Uncompress
                 for chunk in uncompress_data {
                     if metric_names.len() == 0 {
-                        metric_names = ParsedFile::get_metric_names(&chunk);
+                        metric_names = FTDCFileDecoder::get_metric_names(&chunk);
                     }
-                                        
+
                     if let Some(metrics) =
-                        ParsedFile::get_metrics_from_buffer(&metric_names, &chunk) {
+                        FTDCFileDecoder::get_metrics_from_buffer(&metric_names, &chunk)
+                    {
                         println!("{}", metrics.len());
 
                         //let series_name = metrics[0].meta_data.name.as_str();
                         //let data = metrics[0].data;
                         //let s = Series::new(PlSmallStr::from(series_name), data);
-                       
-                        
+
                         /*
                         let mut series : Vec<Series> = vec![];
                         for metric in uncompress_data {
@@ -502,13 +515,14 @@ impl ParsedFile {
                         let file = File::create("example.parquet").expect("could not create file");
                         ParquetWriter::new(file).finish(&mut df); // Write DataFrame to Parquet file.
                         */
-
                     }
                 }
 
                 Ok(())
             }
-            Err(e) => Err("Fatal: {}\n parsing file."),
+            Err(e) => Err(FileDecoderError::Other(anyhow!(
+                "Uncompressing data: {e:?}"
+            ))),
         }
     }
 }
@@ -520,36 +534,33 @@ impl ParsedFile {
 #[cfg(test)]
 
 mod tests {
-    use crate::ParsedFile;
+    use crate::FTDCFileDecoder;
 
     const TEST_FILE_PATH: &str = "diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
     #[test]
     fn file_doesnt_exist() {
-
-        let mut bad_file = ParsedFile::new();
+        let mut bad_file = FTDCFileDecoder::new();
         let result = bad_file.read_file("unexistent");
         match result {
             Ok(read) => {
                 assert!(false)
-            },
+            }
             Err(e) => {
                 println!("Got expected error {e:?}");
             }
         }
-
-
     }
 
     #[test]
     fn should_read_5_chunks() {
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
         assert_eq!(parsed_file.metric_chunks_count, 5);
     }
 
     #[test]
     fn inflate_chunks() {
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
 
         let uncompressed_vec = parsed_file.uncompress_data();
@@ -569,7 +580,7 @@ mod tests {
 
     #[test]
     fn get_metric_names() {
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
 
         let uncompressed_vec = parsed_file.uncompress_data();
@@ -579,7 +590,7 @@ mod tests {
         let all_chunks = uncompressed_vec.unwrap();
         let first_chunk = &all_chunks[0];
 
-        let names = ParsedFile::get_metric_names_json(first_chunk);
+        let names = FTDCFileDecoder::get_metric_names_json(first_chunk);
         if names.is_ok() {
             assert!(true);
         } else {
@@ -590,7 +601,7 @@ mod tests {
 
     #[test]
     fn get_metric_deltas() -> () {
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
 
         let uncompressed_vec = parsed_file.uncompress_data();
@@ -599,7 +610,7 @@ mod tests {
 
         let all_chunks = uncompressed_vec.unwrap();
         let first_chunk = &all_chunks[0];
-        let values = ParsedFile::get_metric_deltas_from_buffer(first_chunk);
+        let values = FTDCFileDecoder::get_metric_deltas_from_buffer(first_chunk);
 
         if let Some(values) = values {
             assert_eq!(values.len(), 3051 * 299);
@@ -617,7 +628,7 @@ mod tests {
 
     #[test]
     fn get_metric_names_2() -> () {
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
 
         let uncompressed_vec = parsed_file.uncompress_data();
@@ -626,7 +637,7 @@ mod tests {
 
         let all_chunks = uncompressed_vec.unwrap();
         let first_chunk = &all_chunks[0];
-        let metrics = ParsedFile::get_metric_names(first_chunk);
+        let metrics = FTDCFileDecoder::get_metric_names(first_chunk);
         assert_eq!(metrics.len(), 3051);
         for m in metrics {
             println!("{}", m.name);
@@ -635,7 +646,7 @@ mod tests {
 
     #[test]
     fn get_metric_data() -> () {
-        let mut parsed_file = ParsedFile::new();
+        let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
 
         let uncompressed_vec = parsed_file.uncompress_data();
@@ -644,10 +655,10 @@ mod tests {
 
         let all_chunks = uncompressed_vec.unwrap();
         let first_chunk = &all_chunks[0];
-        let metric_names = ParsedFile::get_metric_names(first_chunk);
+        let metric_names = FTDCFileDecoder::get_metric_names(first_chunk);
         assert_eq!(metric_names.len(), 3051);
 
-        let xx = ParsedFile::get_metrics_from_buffer(&metric_names, first_chunk);
+        let xx = FTDCFileDecoder::get_metrics_from_buffer(&metric_names, first_chunk);
 
         if let Some(x) = xx {
             assert_eq!(x.len(), 3051);
