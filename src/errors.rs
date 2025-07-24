@@ -1,14 +1,29 @@
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 
-enum FileParsingError {
-    UncompressError,
+/// Enumerates
+#[derive(Debug)]
+pub enum FileParserError {
     FileIOError(std::io::Error),
-    MetricCountError,
+    Other(Box::<dyn Error>, String),
 }
 
-struct ParserError {
-    
-    message: String,
-    source: Option<Box<dyn Error>>,
-    err_type: FileParsingError,
+#[derive(Debug)]
+pub  struct FTDCDecodeError {
+    pub  message: String,
+    pub  source: Option<Box<dyn Error>>,
+}
+
+
+impl Display for FTDCDecodeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FTDC decode error")
+    }
+}
+
+impl Error for FTDCDecodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_deref()
+    }
+
 }

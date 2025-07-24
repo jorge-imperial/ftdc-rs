@@ -9,8 +9,17 @@ use integer_encoding::*;
 use zune_inflate::errors::InflateDecodeErrors;
 use zune_inflate::DeflateDecoder;
 
+use crate::errors::FTDCDecodeError;
+use crate::errors::FileParserError;
+
 use polars::prelude::*;
 
+
+#[derive(Debug, Clone)]
+pub enum OutputFormat {
+    JSON,
+    Parquet,
+}
 
 /// A structure that holds parsed info for a file.
 pub struct ParsedFile {
@@ -119,6 +128,7 @@ impl ParsedFile {
         Ok(json_str.unwrap())
     }
 
+    /// Reads sub-docs from the original BSON doc recursively.
     fn get_docs(doc_name: &str, root: Document, metric_data: &mut Vec<MetricMetaData>) {
         for (k, doc) in root {
             match doc {
@@ -358,62 +368,70 @@ impl ParsedFile {
             total_samples: 0,
         }
     }
-    pub fn read_file(&mut self, file_name: &str) -> Result<(), std::io::Error> {
-        // Open file, get buffed_reader
-        let mut reader = buffered_reader::File::open(file_name)?;
-        loop {
-            //
-            match Document::from_reader(&mut reader) {
-                Ok(metrics) => {
-                    if let Some(chunk_type) = metrics.get("type") {
-                        // println!("Chunk type: {}", chunk_type);
+    pub fn read_file(&mut self, file_name: &str) -> Result<(), FileParserError> {
 
-                        match chunk_type.as_i32().unwrap() {
-                            ParsedFile::METADATA => {
-                                // Doc key is a JSON structure with the host's information.
-                                match metrics.get("doc") {
-                                    Some(doc) => {
-                                        self.metadata = doc.to_string();
+        // Open file, get buffed_reader
+        match  buffered_reader::File::open(file_name) {
+            Ok(mut reader) => {
+
+                loop {
+                    //
+                    match Document::from_reader(&mut reader) {
+                        Ok(metrics) => {
+                            if let Some(chunk_type) = metrics.get("type") {
+                                // println!("Chunk type: {}", chunk_type);
+
+                                match chunk_type.as_i32().unwrap() {
+                                    ParsedFile::METADATA => {
+                                        // Doc key is a JSON structure with the host's information.
+                                        match metrics.get("doc") {
+                                            Some(doc) => {
+                                                self.metadata = doc.to_string();
+                                            }
+                                            _ => {
+                                                println!("'doc' type not found");
+                                            }
+                                        }
+                                    }
+                                    ParsedFile::METRICS => {
+                                        if metrics.contains_key("data") {
+                                            if let Bson::Binary(b) = metrics.get("data").unwrap() {
+                                                self.binary_chunks.push(b.clone());
+                                            }
+                                        }
+                                    }
+                                    ParsedFile::PARAMETERS => {
+                                        // Doc key is a JSON structure with the host's information.
+                                        match metrics.get("doc") {
+                                            Some(doc) => {
+                                                self.parameters = doc.to_string();
+                                            }
+                                            _ => {
+                                                println!("doc type not found");
+                                            }
+                                        }
                                     }
                                     _ => {
-                                        println!("'doc' type not found");
+                                        println!("Unknown doc type: {:?}", chunk_type);
                                     }
                                 }
-                            }
-                            ParsedFile::METRICS => {
-                                if metrics.contains_key("data") {
-                                    if let Bson::Binary(b) = metrics.get("data").unwrap() {
-                                        self.binary_chunks.push(b.clone());
-                                    }
-                                }
-                            }
-                            ParsedFile::PARAMETERS => {
-                                // Doc key is a JSON structure with the host's information.
-                                match metrics.get("doc") {
-                                    Some(doc) => {
-                                        self.parameters = doc.to_string();
-                                    }
-                                    _ => {
-                                        println!("doc type not found");
-                                    }
-                                }
-                            }
-                            _ => {
-                                println!("Unknown doc type: {:?}", chunk_type);
                             }
                         }
+                        Err(e) => {
+                            if !reader.eof() {
+                                println!("Failed to read from file: {}", e);
+                            }
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    if !reader.eof() {
-                        println!("Failed to read from file: {}", e);
-                    }
-                    break;
+                    self.metric_chunks_count += 1;
                 }
             }
-            self.metric_chunks_count += 1;
+            Err(e) => {
+                return Err( FileParserError::FileIOError(e));
+            }
         }
-        //println!("Done with {} chunks", self.count);
+
         Ok(())
     }
     
@@ -422,7 +440,7 @@ impl ParsedFile {
             Ok(uncompress_data) => {
 
                 // TODO: Should check that all chunks have the same number of metrics.
-                let mut metric_names: Vec<MetricMetaData> = vec![]; //  = ParsedFile::get_metric_names(&chunk);
+                let mut metric_names: Vec<MetricMetaData> = vec![];
 
                 // Uncompress
                 for chunk in uncompress_data {
@@ -506,12 +524,24 @@ mod tests {
 
     const TEST_FILE_PATH: &str = "diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn file_doesnt_exist() {
+
+        let mut bad_file = ParsedFile::new();
+        let result = bad_file.read_file("unexistent");
+        match result {
+            Ok(read) => {
+                assert!(false)
+            },
+            Err(e) => {
+                println!("Got expected error {e:?}");
+            }
+        }
+
+
     }
 
     #[test]
-    fn read_5_chunks() {
+    fn should_read_5_chunks() {
         let mut parsed_file = ParsedFile::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
         assert_eq!(parsed_file.metric_chunks_count, 5);
