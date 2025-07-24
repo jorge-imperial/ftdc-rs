@@ -484,7 +484,27 @@ impl FTDCFileDecoder {
         }
     }
 
-    pub fn write_parquet(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
+    pub fn read_and_uncompress(&mut self, file_name : &str) -> Result<Vec<Vec<u8>>, FileDecoderError> {
+
+        match self.read_file(file_name) {
+            Ok(_) => {
+                match self.uncompress_data() {
+                    Ok(uncompressed_vec) => {
+                        Ok(uncompressed_vec)
+                    }
+                    Err(e) => {
+                        Err( FileDecoderError::Other(anyhow!(e)))
+                    }
+                }
+            },
+            Err(e) => {
+                println!("Got expected error {e:?}");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn write_parquet_file(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
         match self.uncompress_data() {
             Ok(uncompress_data) => {
                 // TODO: Should check that all chunks have the same number of metrics.
@@ -525,6 +545,9 @@ impl FTDCFileDecoder {
             ))),
         }
     }
+
+
+
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -536,7 +559,7 @@ impl FTDCFileDecoder {
 mod tests {
     use crate::FTDCFileDecoder;
 
-    const TEST_FILE_PATH: &str = "diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
+    const TEST_FILE_PATH: &str = "test_data/diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
     #[test]
     fn file_doesnt_exist() {
         let mut bad_file = FTDCFileDecoder::new();
@@ -658,11 +681,32 @@ mod tests {
         let metric_names = FTDCFileDecoder::get_metric_names(first_chunk);
         assert_eq!(metric_names.len(), 3051);
 
-        let xx = FTDCFileDecoder::get_metrics_from_buffer(&metric_names, first_chunk);
-
-        if let Some(x) = xx {
-            assert_eq!(x.len(), 3051);
-            println!("{:?}", x.get(0).unwrap().meta_data);
-        }
+       if let Some(metric_data) = FTDCFileDecoder::get_metrics_from_buffer(&metric_names, first_chunk)  {
+            assert_eq!(metric_data.len(), 3051);
+            println!("{:?}", metric_data.get(0).unwrap().meta_data);
+       }
     }
+
+    #[test]
+    fn write_to_parquet()   {
+        let mut parsed_file = FTDCFileDecoder::new();
+
+        let data = parsed_file.read_and_uncompress(TEST_FILE_PATH);
+        assert!(data.is_ok());
+
+        match data {
+            Ok(data) => {
+                let metric_names = FTDCFileDecoder::get_metric_names(&data[0]);
+                if let Some(metric_data) = FTDCFileDecoder::get_metrics_from_buffer(&metric_names, &data[0])  {
+                    assert_eq!(metric_data.len(), 3051);
+                    println!("{:?}", metric_data.get(0).unwrap().meta_data);
+                }
+            },
+            Err(_) => {},
+        }
+
+
+    }
+
+
 }
