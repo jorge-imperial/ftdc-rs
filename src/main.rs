@@ -1,5 +1,5 @@
 use clap::Parser;
-use ftdc::{FTDCFileDecoder, OutputFormat};
+use ftdc::{FTDCFileDecoder};
 use std::fs;
 use std::path::Path;
 
@@ -41,7 +41,7 @@ fn main() -> std::io::Result<()> {
 
         let result = file_parser.read_file(&*f);
         match result {
-            Ok(parsed_file) => {
+            Ok(_parsed_file) => {
                 //parsed_file.write_parquet(&*f).expect("TODO: panic message");
             }
             Err(error) => {
