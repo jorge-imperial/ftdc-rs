@@ -1,5 +1,5 @@
 use clap::Parser;
-use ftdc::{FTDCFileDecoder};
+use ftdc::FTDCFileDecoder;
 use std::fs;
 use std::path::Path;
 
