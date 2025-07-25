@@ -6,13 +6,10 @@ use bson::{Binary, Bson, Document};
 use buffered_reader;
 use buffered_reader::BufferedReader;
 use integer_encoding::*;
-use zune_inflate::DeflateDecoder;
 use zune_inflate::errors::InflateDecodeErrors;
+use zune_inflate::DeflateDecoder;
 
-use crate::errors::{FTDCDecodeError, FileDecoderError};
-
-use polars::prelude::*;
-use thiserror::__private::AsDynError;
+use crate::errors::FileDecoderError;
 
 #[derive(Debug, Clone)]
 pub enum OutputFormat {
@@ -25,7 +22,6 @@ pub enum OutputFormat {
 pub struct FTDCFileDecoder {
     metadata: String,
     parameters: String,
-
     metric_chunks_count: usize,
     binary_chunks: Vec<Binary>,
 }
@@ -35,14 +31,13 @@ struct MetricData {
     name: String,
     initial: u64,
     metric_type: Bson,
-
     metrics: Option<usize>,
     data: Option<[u64; FTDCFileDecoder::MAX_METRICS]>,
 }
 
-struct Metric {
-    name: String,
-    data: Vec<u64>,
+pub struct Metric {
+    pub name: String,
+    pub data: Vec<u64>,
 }
 
 impl FTDCFileDecoder {
@@ -331,39 +326,42 @@ impl FTDCFileDecoder {
     fn extract_metrics_from_buffer<'a>(
         meta_data_vec: &mut Vec<MetricData>,
         buffer: &Vec<u8>,
-    ) -> Option<usize> {
+    ) -> Result<usize, FileDecoderError> {
         // get deltas
-        let deltas_option = FTDCFileDecoder::get_metric_deltas_from_buffer(buffer);
-        if deltas_option.is_none() {
-            return None;
-        }
-        let deltas = deltas_option.unwrap();
-        let deltas_slice = deltas.as_slice();
+        match FTDCFileDecoder::get_metric_deltas_from_buffer(buffer) {
+            Some(deltas) => {
+                let deltas_slice = deltas.as_slice();
 
-        let (_data_size, metric_count, delta_count) =
-            FTDCFileDecoder::read_header(buffer.as_slice());
+                let (_data_size, metric_count, delta_count) =
+                    FTDCFileDecoder::read_header(buffer.as_slice());
 
-        assert_eq!(deltas.len(), metric_count * delta_count);
+                assert_eq!(deltas.len(), metric_count * delta_count);
 
-        // Initialize return vectors
-        for i in 0..meta_data_vec.len() {
-            let meta = meta_data_vec.get(i).unwrap();
-            let mut data: [u64; FTDCFileDecoder::MAX_METRICS] = [0; FTDCFileDecoder::MAX_METRICS];
-            data[0] = meta.initial;
+                // Initialize return vectors
+                for i in 0..meta_data_vec.len() {
+                    let meta = meta_data_vec.get(i).unwrap();
+                    let mut data: [u64; FTDCFileDecoder::MAX_METRICS] =
+                        [0; FTDCFileDecoder::MAX_METRICS];
+                    data[0] = meta.initial;
 
-            // Evaluation of metrics array is made here
-            for j in 1..delta_count {
-                data[j] = data[j - 1];
-                data[j] = deltas_slice[(delta_count * i) + j];
-                data[j] =
-                    FTDCFileDecoder::add_delta(data[j - 1], deltas_slice[(delta_count * i) + j]);
+                    // Evaluation of metrics array is made here
+                    for j in 1..delta_count {
+                        data[j] = data[j - 1];
+                        data[j] = deltas_slice[(delta_count * i) + j];
+                        data[j] = FTDCFileDecoder::add_delta(
+                            data[j - 1],
+                            deltas_slice[(delta_count * i) + j],
+                        );
+                    }
+
+                    meta_data_vec.get_mut(i).unwrap().data = Option::from(data);
+                    meta_data_vec.get_mut(i).unwrap().metrics = Option::from(delta_count);
+                }
+
+                Ok(meta_data_vec.len())
             }
-
-            meta_data_vec.get_mut(i).unwrap().data = Option::from(data);
-            meta_data_vec.get_mut(i).unwrap().metrics = Option::from(delta_count);
+            None => Err(FileDecoderError::Other(anyhow!("No deltas found."))),
         }
-
-        Some(meta_data_vec.len())
     }
 
     pub fn new() -> FTDCFileDecoder {
@@ -487,35 +485,34 @@ impl FTDCFileDecoder {
         for chunk in data_chunks {
             let mut metric_data = FTDCFileDecoder::extract_metric_names(&chunk)?;
 
-            if let Some(metric_data_size) =
-                FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, &chunk)
-            {
-                // Check for consistency: All chunks have the same number of metrics
-                if expected_metrics == 0 {
-                    expected_metrics = metric_data.len();
+            let _metric_data_size =
+                FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, &chunk)?;
 
-                    // allocate Metric
-                    out.extend(metric_data.into_iter().map(|m| {
-                        let mut v = Vec::with_capacity(max_size_of_full_metrics);
-                        if let Some(slice) = m.data {
-                            v.extend_from_slice(&slice);
-                        }
-                        Metric {
-                            name: m.name,
-                            data: v,
-                        }
-                    }));
-                } else {
-                    if expected_metrics != metric_data.len() {
-                        return Err(FileDecoderError::Other(anyhow!(
-                            "Inconsistent number of metrics across chunks."
-                        )));
+            // Check for consistency: All chunks have the same number of metrics
+            if expected_metrics == 0 {
+                expected_metrics = metric_data.len();
+
+                // allocate Metric
+                out.extend(metric_data.into_iter().map(|m| {
+                    let mut v = Vec::with_capacity(max_size_of_full_metrics);
+                    if let Some(slice) = m.data {
+                        v.extend_from_slice(&slice);
                     }
+                    Metric {
+                        name: m.name,
+                        data: v,
+                    }
+                }));
+            } else {
+                if expected_metrics != metric_data.len() {
+                    return Err(FileDecoderError::Other(anyhow!(
+                        "Inconsistent number of metrics across chunks."
+                    )));
+                }
 
-                    for (i, md) in metric_data.iter().enumerate() {
-                        if let Some(s) = md.data {
-                            out[i].data.extend_from_slice(s.as_slice());
-                        }
+                for (i, md) in metric_data.iter().enumerate() {
+                    if let Some(s) = md.data {
+                        out[i].data.extend_from_slice(s.as_slice());
                     }
                 }
             }
@@ -523,34 +520,6 @@ impl FTDCFileDecoder {
         Ok(out)
     }
 
-    pub fn write_parquet_file(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
-        match self.uncompress_data() {
-            Ok(uncompress_data) => {
-                // TODO: Should check that all chunks have the same number of metrics.
-                let mut metric_data: Vec<MetricData> = vec![]; //  = ParsedFile::get_metric_names(&chunk);
-
-                // Uncompress
-                for chunk in uncompress_data {
-                    if metric_data.len() == 0 {
-                        metric_data = FTDCFileDecoder::extract_metric_names(&chunk)?;
-                    }
-
-                    if let Some(metrics) =
-                        FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, &chunk)
-                    {
-                        println!("{}", metric_data.len());
-
-              
-                    }
-                }
-
-                Ok(())
-            }
-            Err(e) => Err(FileDecoderError::Other(anyhow!(
-                "Uncompressing data: {e:?}"
-            ))),
-        }
-    }
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -671,7 +640,7 @@ mod tests {
                     println!("{}", m.name);
                 }
             }
-            Err(e) => {}
+            Err(_e) => {}
         }
     }
 
@@ -691,14 +660,15 @@ mod tests {
             Ok(mut metric_data) => {
                 assert_eq!(metric_data.len(), 3051);
 
-                if let Some(metric_data_size) =
-                    FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, first_chunk)
-                {
-                    assert_eq!(metric_data_size, 3051);
-                    println!("{:?}", metric_data.get(0).unwrap());
+                match FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, first_chunk) {
+                    Ok(metric_data_size) => {
+                        assert_eq!(metric_data_size, 3051);
+                        println!("{:?}", metric_data.get(0).unwrap());
+                    }
+                    Err(_e) => {}
                 }
             }
-            Err(e) => {}
+            Err(_e) => {}
         }
     }
 
