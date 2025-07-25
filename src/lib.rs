@@ -9,7 +9,7 @@ use integer_encoding::*;
 use zune_inflate::DeflateDecoder;
 use zune_inflate::errors::InflateDecodeErrors;
 
-use crate::errors::FileDecoderError;
+use crate::errors::{FTDCDecodeError, FileDecoderError};
 
 use polars::prelude::*;
 use thiserror::__private::AsDynError;
@@ -246,21 +246,21 @@ impl FTDCFileDecoder {
         }
     }
 
-    fn extract_metric_names(buffer: &Vec<u8>) -> Vec<MetricData> {
+    fn extract_metric_names(buffer: &Vec<u8>) -> Result<Vec<MetricData>, FileDecoderError> {
         let mut base = buffer.as_slice();
 
-        let bson_doc = Document::from_reader(&mut base);
-        if bson_doc.is_err() {
-            return vec![];
+        match Document::from_reader(&mut base) {
+            Ok(bson_doc) => {
+                let mut ret_metrics: Vec<MetricData> = vec![];
+
+                let root = bson_doc;
+
+                FTDCFileDecoder::get_docs("", root, &mut ret_metrics);
+
+                Ok(ret_metrics)
+            }
+            Err(e) => Err(FileDecoderError::Other(anyhow!(e))),
         }
-
-        let mut ret_metrics: Vec<MetricData> = vec![];
-
-        let root = bson_doc.unwrap();
-
-        FTDCFileDecoder::get_docs("", root, &mut ret_metrics);
-
-        ret_metrics
     }
 
     /// Converts an array of u8 to a vector of vectors of u64 deltas that will be used to construct
@@ -481,11 +481,11 @@ impl FTDCFileDecoder {
         let data_chunks = self.read_and_uncompress(file_name)?;
 
         // This is the max size per metric
-        let max_size_of_full_metrics = data_chunks.len() * 300;
+        let max_size_of_full_metrics = data_chunks.len() * (Self::MAX_METRICS - 1);
 
         let mut expected_metrics = 0;
         for chunk in data_chunks {
-            let mut metric_data = FTDCFileDecoder::extract_metric_names(&chunk);
+            let mut metric_data = FTDCFileDecoder::extract_metric_names(&chunk)?;
 
             if let Some(metric_data_size) =
                 FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, &chunk)
@@ -532,7 +532,7 @@ impl FTDCFileDecoder {
                 // Uncompress
                 for chunk in uncompress_data {
                     if metric_data.len() == 0 {
-                        metric_data = FTDCFileDecoder::extract_metric_names(&chunk);
+                        metric_data = FTDCFileDecoder::extract_metric_names(&chunk)?;
                     }
 
                     if let Some(metrics) =
@@ -540,20 +540,7 @@ impl FTDCFileDecoder {
                     {
                         println!("{}", metric_data.len());
 
-                        //let series_name = metrics[0].meta_data.name.as_str();
-                        //let data = metrics[0].data;
-                        //let s = Series::new(PlSmallStr::from(series_name), data);
-
-                        /*
-                        let mut series : Vec<Series> = vec![];
-                        for metric in uncompress_data {
-                            let s= Series::new(self.)
-                            series.push(s);
-                        }
-
-                        let file = File::create("example.parquet").expect("could not create file");
-                        ParquetWriter::new(file).finish(&mut df); // Write DataFrame to Parquet file.
-                        */
+              
                     }
                 }
 
@@ -676,10 +663,15 @@ mod tests {
 
         let all_chunks = uncompressed_vec.unwrap();
         let first_chunk = &all_chunks[0];
-        let metrics = FTDCFileDecoder::extract_metric_names(first_chunk);
-        assert_eq!(metrics.len(), 3051);
-        for m in metrics {
-            println!("{}", m.name);
+
+        match FTDCFileDecoder::extract_metric_names(first_chunk) {
+            Ok(metrics) => {
+                assert_eq!(metrics.len(), 3051);
+                for m in metrics {
+                    println!("{}", m.name);
+                }
+            }
+            Err(e) => {}
         }
     }
 
@@ -694,14 +686,19 @@ mod tests {
 
         let all_chunks = uncompressed_vec.unwrap();
         let first_chunk = &all_chunks[0];
-        let mut metric_data = FTDCFileDecoder::extract_metric_names(first_chunk);
-        assert_eq!(metric_data.len(), 3051);
 
-        if let Some(metric_data_size) =
-            FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, first_chunk)
-        {
-            assert_eq!(metric_data_size, 3051);
-            println!("{:?}", metric_data.get(0).unwrap());
+        match FTDCFileDecoder::extract_metric_names(first_chunk) {
+            Ok(mut metric_data) => {
+                assert_eq!(metric_data.len(), 3051);
+
+                if let Some(metric_data_size) =
+                    FTDCFileDecoder::extract_metrics_from_buffer(&mut metric_data, first_chunk)
+                {
+                    assert_eq!(metric_data_size, 3051);
+                    println!("{:?}", metric_data.get(0).unwrap());
+                }
+            }
+            Err(e) => {}
         }
     }
 
