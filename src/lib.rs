@@ -8,11 +8,12 @@ use buffered_reader::BufferedReader;
 use integer_encoding::*;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use thread::spawn;
 use zune_inflate::DeflateDecoder;
 use zune_inflate::errors::InflateDecodeErrors;
 
 use crate::errors::FileDecoderError;
+
+use polars::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum OutputFormat {
@@ -42,6 +43,8 @@ pub struct Metric {
     pub name: String,
     pub data: Vec<u64>,
 }
+
+
 
 impl FTDCFileDecoder {
     const METADATA: i32 = 0;
@@ -82,12 +85,12 @@ impl FTDCFileDecoder {
         }
     }
 
-    /// Uncompresses all binary blobs
-    pub fn uncompress_data(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
+    /// Uncompresses all binary blobs - Single threaded uncompression
+    pub fn uncompress_data_st(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
         let mut uncompressed_data_vector: Vec<Vec<u8>> =
             Vec::with_capacity(self.metric_chunks_count);
 
-        // Single threaded uncompression
+        //
         for b in self.binary_chunks.iter() {
             let blob = FTDCFileDecoder::inflate_blob(b);
 
@@ -102,6 +105,35 @@ impl FTDCFileDecoder {
             }
         }
         Ok(uncompressed_data_vector)
+    }
+
+    /// Uncompresses all binary blobs - Multi threaded uncompression
+    pub fn uncompress_data(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
+
+        let uncompressed_data_vector = Arc::new(Mutex::new(vec![]));
+        let binary_chunks_x = Arc::new(self.binary_chunks.clone());
+
+        let mut handles = vec![];
+
+        for i in 0..binary_chunks_x.len() {
+            let udv = Arc::clone(&uncompressed_data_vector);
+            let bc = Arc::clone(&binary_chunks_x);
+
+            let handle = thread::spawn(move || {
+                let binary_chunk = bc.get(i).unwrap();
+                let inflated_data: Vec<u8> = FTDCFileDecoder::inflate_blob(binary_chunk).unwrap();
+
+                let mut uncompressed_data_vector = udv.lock().unwrap();
+                uncompressed_data_vector.push(inflated_data);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        Ok(uncompressed_data_vector.lock().unwrap().clone())
     }
 
     /// Returns a valid JSON with metric names and initial value.
@@ -532,7 +564,10 @@ impl FTDCFileDecoder {
 #[cfg(test)]
 
 mod tests {
-    use crate::FTDCFileDecoder;
+    use polars::df;
+    use polars::frame::DataFrame;
+    use crate::{FTDCFileDecoder, Metric};
+    use crate::errors::FileDecoderError;
 
     const TEST_FILE_PATH: &str = "test_data/diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
     #[test]
@@ -676,10 +711,21 @@ mod tests {
     }
 
     #[test]
-    fn write_to_parquet() {
+    fn writing_to_parquet() {
         let mut parsed_file = FTDCFileDecoder::new();
 
         let data = parsed_file.read_and_decode(TEST_FILE_PATH);
         assert!(data.is_ok());
+
+        match data {
+            Ok(metrics) => {
+                let df : DataFrame = DataFrame::default();
+
+                //df._add_series();
+
+
+            }
+            Err(e) => {}
+        }
     }
 }
