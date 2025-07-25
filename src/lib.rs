@@ -6,8 +6,11 @@ use bson::{Binary, Bson, Document};
 use buffered_reader;
 use buffered_reader::BufferedReader;
 use integer_encoding::*;
-use zune_inflate::errors::InflateDecodeErrors;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use thread::spawn;
 use zune_inflate::DeflateDecoder;
+use zune_inflate::errors::InflateDecodeErrors;
 
 use crate::errors::FileDecoderError;
 
@@ -65,7 +68,7 @@ impl FTDCFileDecoder {
         )
     }
 
-    fn inflate_blob(b: &mut Binary) -> Result<Vec<u8>, InflateDecodeErrors> {
+    fn inflate_blob(b: &Binary) -> Result<Vec<u8>, InflateDecodeErrors> {
         // Get blob
         let compressed_buffer = b.bytes.as_slice();
         // Compressed buffer. Ignore first 4 bytes.
@@ -79,12 +82,14 @@ impl FTDCFileDecoder {
         }
     }
 
-    pub fn uncompress_data(&mut self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
+    /// Uncompresses all binary blobs
+    pub fn uncompress_data(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
         let mut uncompressed_data_vector: Vec<Vec<u8>> =
             Vec::with_capacity(self.metric_chunks_count);
 
-        for b in self.binary_chunks.iter_mut() {
-            let blob = FTDCFileDecoder::inflate_blob(&mut *b);
+        // Single threaded uncompression
+        for b in self.binary_chunks.iter() {
+            let blob = FTDCFileDecoder::inflate_blob(b);
 
             match blob {
                 Ok(encoded_data) => {
@@ -96,7 +101,6 @@ impl FTDCFileDecoder {
                 }
             }
         }
-
         Ok(uncompressed_data_vector)
     }
 
@@ -519,7 +523,6 @@ impl FTDCFileDecoder {
         }
         Ok(out)
     }
-
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
