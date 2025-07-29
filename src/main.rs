@@ -66,72 +66,25 @@ fn main() -> std::io::Result<()> {
         files_to_parse.push(path_directory.display().to_string());
     }
 
-    for f in files_to_parse {
+    for file_name in files_to_parse {
         // Display additional information if info parameter is true
         if args.info {
-            if let Err(e) = display_file_info(&f) {
+            if let Err(e) = display_file_info(&file_name) {
                 println!("Error displaying file info: {}", e);
             }
         }
 
-        // TODO: This can be parallelized per file
-        let mut file_parser = FTDCFileDecoder::new();
+        let outf = Path::new(&file_name).file_name().unwrap().to_str().unwrap();
+        let out_file_name = format!("{}{}.parquet", args.output, outf);
 
-        // Use read_and_decode instead of read_file to get the decoded data
-        let result = file_parser.read_and_decode(&*f);
-        match result {
-            Ok(metrics) => {
-                if args.info {
-                    println!("Successfully processed file: {}", f);
-                    println!("Number of metrics: {}", metrics.len());
-                    println!("-----------------------------------");
-                }
+        println!("Processing {file_name} -> {out_file_name}");
 
-                // Get the output file path
-                let file_name = Path::new(&f)
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("output"));
-                let mut output_path = Path::new(&args.output).to_path_buf();
-
-                // Write the decoded data to the specified output format
-                if args.format == "json" {
-                    // Write to JSON format
-                    output_path.push(format!("{}.json", file_name.to_string_lossy()));
-
-                    // Convert metrics to JSON
-                    let json = serde_json::to_string_pretty(
-                        &metrics
-                            .iter()
-                            .map(|m| {
-                                serde_json::json!({
-                                    "name": m.name,
-                                    "data": m.data
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap();
-
-                    // Write JSON to file
-                    fs::write(&output_path, json)?;
-
-                    if args.info {
-                        println!("Wrote JSON output to: {}", output_path.display());
-                    }
-                } else {
-                    // Write to Parquet format
-                    output_path.push(format!("{}.parquet", file_name.to_string_lossy()));
-
-                    // TODO: Implement Parquet output
-                    // For now, just write a placeholder message
-                    println!(
-                        "Parquet output not yet implemented. Would write to: {}",
-                        output_path.display()
-                    );
-                }
+        match FTDCFileDecoder::write_to_parquet(&*file_name, &*out_file_name) {
+            Ok(_) => {
+                println!("Successfully written to {}", out_file_name);
             }
-            Err(error) => {
-                println!("{error:?}")
+            Err(_e) => {
+                println!("Failed to write to {}", out_file_name);
             }
         }
     }
