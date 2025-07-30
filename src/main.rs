@@ -14,7 +14,7 @@ struct Args {
 
     /// Path where the output files will be written.
     #[arg(short, long, default_value = "./")]
-    output: String,
+    prefix: String,
 
     /// Display additional information
     #[arg(short, long)]
@@ -75,7 +75,7 @@ fn main() -> std::io::Result<()> {
         }
 
         let outf = Path::new(&file_name).file_name().unwrap().to_str().unwrap();
-        let out_file_name = format!("{}{}.parquet", args.output, outf);
+        let out_file_name = format!("{}{}.parquet", args.prefix, outf);
 
         println!("Processing {file_name} -> {out_file_name}");
 
