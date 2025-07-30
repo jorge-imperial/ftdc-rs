@@ -6,8 +6,6 @@ use bson::{Binary, Bson, Document};
 use buffered_reader;
 use buffered_reader::BufferedReader;
 use std::collections::HashMap;
-//use integer_encoding::*;
-use polars::frame::column::Column;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use zune_inflate::DeflateDecoder;
@@ -169,7 +167,6 @@ impl FTDCFileDecoder {
 
             let handle = thread::spawn(move || -> Result<i32, InflateDecodeErrors> {
                 if let Some(binary_chunk) = bc.get(i) {
-                    //let binary_chunk = bc.get(i).unwrap();
                     let inflated_data: Vec<u8> = FTDCFileDecoder::inflate_blob(binary_chunk)?;
 
                     let mut uncompressed_data_vector = udv.lock().unwrap();
@@ -230,11 +227,7 @@ impl FTDCFileDecoder {
                         data: None,
                     });
                 }
-                Bson::String(_) => {
-                    //names.push( format!("{doc_name}.{}", k.to_string()));
-                    //metrics.push(v.len() as u64);
-                    //println!("{doc_name}.{k} : '{}'", v);
-                }
+                Bson::String(_) => {}
                 Bson::Array(arr) => {
                     let mut i = 0;
                     for a in arr {
@@ -525,49 +518,123 @@ impl FTDCFileDecoder {
         }
     }
 
+    pub fn decode_data(
+        &self,
+        data_chunks: Vec<Vec<u8>>,
+    ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
+        let metric_data: HashMap<String, Vec<u64>> = HashMap::new();
+        let metric_data_arc = Arc::new(Mutex::new(metric_data));
+        let data_chunks_arc = Arc::new(data_chunks);
+
+        let mut handles = vec![];
+
+        for i in 0..data_chunks_arc.len() {
+            let mdh = Arc::clone(&metric_data_arc);
+            let dc = Arc::clone(&data_chunks_arc);
+
+            let handle = thread::spawn(move || -> Result<i32, FileDecoderError> {
+                if let Some(data_chunk) = dc.get(i) {
+                    let mut metric_data = FTDCFileDecoder::extract_metric_meta_data(&data_chunk)?;
+                    let _metric_data_size = FTDCFileDecoder::extract_all_metrics_from_buffer(
+                        &mut metric_data,
+                        &data_chunk,
+                    )?;
+
+                    for metric in metric_data {
+                        if let Some(old_slice) = metric.data
+                            && let Some(used_metrics) = metric.metrics
+                        {
+                            // remove first char, which is a dot.
+                            let name = String::from(metric.name).split_off(1);
+
+                            let mut out = mdh.lock().unwrap();
+                            if out.contains_key(&name) {
+                                if let Some(metric_member_data) = out.get_mut(&name) {
+                                    // add slice to vector
+                                    metric_member_data
+                                        .append(&mut old_slice[0..used_metrics].to_vec());
+                                } else {
+                                    return Err(FileDecoderError::Other(anyhow!(
+                                        "Could not find metric name '{name}'"
+                                    )));
+                                }
+                            } else {
+                                // insert new
+                                let mut vec = Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY);
+                                vec.append(&mut old_slice[0..used_metrics].to_vec());
+                                out.insert(name, vec);
+                            }
+                        } else {
+                            return Err(FileDecoderError::Other(anyhow!(
+                                "Could not find valid data in metrics: {metric:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(FileDecoderError::Other(anyhow!(
+                        "Could not find data in metrics"
+                    )));
+                }
+
+                Ok(0)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = handle.join().unwrap();
+        }
+
+        Ok(metric_data_arc.lock().unwrap().clone())
+    }
+
     /// Will read a file, uncompress chunks and decode deltas.
     pub fn read_and_decode(
         &mut self,
         file_name: &str,
     ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
-        let mut out: HashMap<String, Vec<u64>> = HashMap::new();
+        //let mut out: HashMap<String, Vec<u64>> = HashMap::new();
 
         let data_chunks = self.read_and_uncompress(file_name)?;
 
-        // todo: parallelize this loop per chunk.
-        for chunk in data_chunks {
-            let mut metric_data = FTDCFileDecoder::extract_metric_meta_data(&chunk)?;
+        let decoded_data = self.decode_data(data_chunks)?;
 
-            let _metric_data_size =
-                FTDCFileDecoder::extract_all_metrics_from_buffer(&mut metric_data, &chunk)?;
+        Ok(decoded_data)
+    }
 
-            for metric in metric_data {
-                if let Some(old_slice) = metric.data
-                    && let Some(used_metrics) = metric.metrics {
+    /// Converts a HashMap<String, Vec<u64>> to a polars DataFrame
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics` - A HashMap where keys are metric names and values are vectors of u64 values
+    ///
+    /// # Returns
+    ///
+    /// * `Result<DataFrame, FileDecoderError>` - A polars DataFrame with columns named after the keys in the hashmap
+    pub fn to_dataframe(metrics: HashMap<String, Vec<u64>>) -> Result<DataFrame, FileDecoderError> {
+        // Create a vector to hold our Series objects
+        let mut series_vec: Vec<Series> = Vec::new();
 
-                    let name = String::from(metric.name);
+        // Find the maximum length of any vector in the hashmap to determine row count
+        let max_len = metrics.values().map(|v| v.len()).max().unwrap_or(0);
 
-                    if out.contains_key(&name) {
-                        if let Some(metric_member_data) = out.get_mut(&name) {
-                            // add slice to vector
-                            metric_member_data.append(&mut old_slice[0..used_metrics].to_vec());
-                        } else {
-                            return Err(FileDecoderError::Other(anyhow!("Could not find metric name '{name}'")));
-                        }
-                    } else {
-                        // insert new
-                        let mut vec = Vec::with_capacity(Self::INITIAL_METRIC_CAPACITY);
-                        vec.append(&mut old_slice[0..used_metrics].to_vec());
-                        out.insert(name, vec);
-                    }
-                }
-                else {
-                    return Err(FileDecoderError::Other(anyhow!("Could not find valid data in metrics: {metric:?}")))
-                }
+        // Create a Series for each key-value pair in the hashmap
+        for (key, values) in metrics {
+            // If the vector is shorter than max_len, pad it with zeros
+            let mut padded_values = values.clone();
+            if padded_values.len() < max_len {
+                padded_values.resize(max_len, 0);
             }
+
+            // Create a Series from the vector and add it to our vector of Series
+            // Convert the key to PlSmallStr using .into() without the &
+            let series = Series::new(key.into(), padded_values);
+            series_vec.push(series);
         }
 
-        Ok(out)
+        // Create a DataFrame from the vector of Series
+        // DataFrame::from_iter returns a DataFrame directly, not a Result
+        Ok(DataFrame::from_iter(series_vec))
     }
 
     pub fn write_to_parquet(
@@ -578,6 +645,16 @@ impl FTDCFileDecoder {
 
         let metrics = parsed_file.read_and_decode(input_file_name)?;
 
+        // Convert the metrics hashmap to a DataFrame
+        let mut df = Self::to_dataframe(metrics)?;
+
+        // Write the DataFrame to a parquet file
+        let mut file = std::fs::File::create(output_file_name)
+            .map_err(|e| FileDecoderError::Other(anyhow!("Failed to create output file: {}", e)))?;
+
+        ParquetWriter::new(&mut file)
+            .finish(&mut df)
+            .map_err(|e| FileDecoderError::Other(anyhow!("Failed to write parquet file: {}", e)))?;
 
         Ok(())
     }
@@ -591,6 +668,7 @@ impl FTDCFileDecoder {
 
 mod tests {
     use crate::FTDCFileDecoder;
+    use std::collections::HashMap;
 
     //const TEST_FILE_PATH: &str = "test_data/diagnostic.data/metrics.2025-04-15T16-48-31Z-00000";
 
@@ -710,5 +788,50 @@ mod tests {
         });
 
         assert!(true);
+    }
+
+    #[test]
+    fn test_to_dataframe() {
+        // Create a test HashMap with some data
+        let mut test_metrics: HashMap<String, Vec<u64>> = HashMap::new();
+        test_metrics.insert("metric1".to_string(), vec![1, 2, 3, 4, 5]);
+        test_metrics.insert("metric2".to_string(), vec![10, 20, 30, 40, 50]);
+        test_metrics.insert("metric3".to_string(), vec![100, 200, 300]); // Shorter vector to test padding
+
+        // Convert the HashMap to a DataFrame
+        let df_result = FTDCFileDecoder::to_dataframe(test_metrics);
+
+        // Verify the result is Ok
+        assert!(df_result.is_ok());
+
+        let df = df_result.unwrap();
+
+        // Verify the DataFrame has the expected structure
+        assert_eq!(df.width(), 3); // 3 columns
+        assert_eq!(df.height(), 5); // 5 rows (max length of the vectors)
+
+        // Verify column names
+        let column_names: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(column_names.contains(&"metric1".to_string()));
+        assert!(column_names.contains(&"metric2".to_string()));
+        assert!(column_names.contains(&"metric3".to_string()));
+
+        // Verify the data in the columns
+        let metric1_col = df.column("metric1").unwrap();
+        let metric2_col = df.column("metric2").unwrap();
+        let metric3_col = df.column("metric3").unwrap();
+
+        // Check first values
+        assert_eq!(metric1_col.u64().unwrap().get(0).unwrap(), 1);
+        assert_eq!(metric2_col.u64().unwrap().get(0).unwrap(), 10);
+        assert_eq!(metric3_col.u64().unwrap().get(0).unwrap(), 100);
+
+        // Check that metric3 was padded with zeros
+        assert_eq!(metric3_col.u64().unwrap().get(3).unwrap(), 0);
+        assert_eq!(metric3_col.u64().unwrap().get(4).unwrap(), 0);
     }
 }
