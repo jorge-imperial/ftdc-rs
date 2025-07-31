@@ -611,7 +611,7 @@ impl FTDCFileDecoder {
     /// # Returns
     ///
     /// * `Result<DataFrame, FileDecoderError>` - A polars DataFrame with columns named after the keys in the hashmap
-    pub fn to_dataframe(metrics: HashMap<String, Vec<u64>>) -> Result<DataFrame, FileDecoderError> {
+    pub fn metrics_to_dataframe(metrics: HashMap<String, Vec<u64>>) -> Result<DataFrame, FileDecoderError> {
         // Create a vector to hold our Series objects
         let mut series_vec: Vec<Series> = Vec::new();
 
@@ -640,13 +640,14 @@ impl FTDCFileDecoder {
     pub fn write_to_parquet(
         input_file_name: &str,
         output_file_name: &str,
+        metadata: Option<String>,
     ) -> Result<(), FileDecoderError> {
         let mut parsed_file = FTDCFileDecoder::new();
 
         let metrics = parsed_file.read_and_decode(input_file_name)?;
 
         // Convert the metrics hashmap to a DataFrame
-        let mut df = Self::to_dataframe(metrics)?;
+        let mut df = Self::metrics_to_dataframe(metrics)?;
 
         // Write the DataFrame to a parquet file
         let mut file = std::fs::File::create(output_file_name)
@@ -656,6 +657,31 @@ impl FTDCFileDecoder {
             .finish(&mut df)
             .map_err(|e| FileDecoderError::Other(anyhow!("Failed to write parquet file: {}", e)))?;
 
+        if let Some(metadata_file) = metadata {
+            // Create entry
+            let metric_names: Vec<String> = df
+                .get_column_names()
+                .iter()
+                .map(move |name| -> String { name.to_string() })
+                .collect();
+
+            // Convert the Metadata struct to a JSON string
+            let json_data = serde_json::json!({
+                "metadata": parsed_file.metadata,
+                "parameters":parsed_file.parameters,
+                "chunks_in_file": parsed_file.metric_chunks_count,
+                "metrics": metric_names
+            });
+
+            // Write the JSON string to the specified file
+            let json_string = serde_json::to_string_pretty(&json_data).map_err(|e| {
+                FileDecoderError::Other(anyhow!("Failed to serialize metadata to JSON: {}", e))
+            })?;
+
+            std::fs::write(&metadata_file, json_string).map_err(|e| {
+                FileDecoderError::Other(anyhow!("Failed to write metadata file: {}", e))
+            })?;
+        }
         Ok(())
     }
 }
@@ -799,7 +825,7 @@ mod tests {
         test_metrics.insert("metric3".to_string(), vec![100, 200, 300]); // Shorter vector to test padding
 
         // Convert the HashMap to a DataFrame
-        let df_result = FTDCFileDecoder::to_dataframe(test_metrics);
+        let df_result = FTDCFileDecoder::metrics_to_dataframe(test_metrics);
 
         // Verify the result is Ok
         assert!(df_result.is_ok());

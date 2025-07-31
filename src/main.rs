@@ -13,7 +13,7 @@ struct Args {
     path: String,
 
     /// Path where the output files will be written.
-    #[arg(short, long, default_value = "./")]
+    #[arg(long, default_value = "./")]
     prefix: String,
 
     /// Display additional information
@@ -23,6 +23,10 @@ struct Args {
     /// Output format (json or parquet)
     #[arg(short, long, default_value = "parquet")]
     format: String,
+
+    /// Write the metrics in the file(s) to a JSON
+    #[arg(short, long)]
+    metadata: bool,
 }
 
 /// Displays additional information about a file when the info parameter is true
@@ -74,12 +78,21 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        let outf = Path::new(&file_name).file_name().unwrap().to_str().unwrap();
-        let out_file_name = format!("{}{}.parquet", args.prefix, outf);
+        let full_path = Path::new(&file_name).file_name().unwrap().to_str().unwrap();
+        let out_file_name = format!("{}{}.parquet", args.prefix, full_path);
 
         println!("Processing {file_name} -> {out_file_name}");
 
-        match FTDCFileDecoder::write_to_parquet(&*file_name, &*out_file_name) {
+        // optional metadata output
+        let metadata;
+        if args.metadata {
+            let metadata_file_path = format!("{}{}_metadata.json", args.prefix, out_file_name);
+            metadata = Option::Some(metadata_file_path);
+        } else {
+            metadata = Option::None;
+        }
+
+        match FTDCFileDecoder::write_to_parquet(&*file_name, &*out_file_name, metadata) {
             Ok(_) => {
                 println!("Successfully written to {}", out_file_name);
             }
