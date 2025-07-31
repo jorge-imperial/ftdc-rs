@@ -20,10 +20,6 @@ struct Args {
     #[arg(short, long)]
     info: bool,
 
-    /// Output format (json or parquet)
-    #[arg(short, long, default_value = "parquet")]
-    format: String,
-
     /// Write the metrics in the file(s) to a JSON
     #[arg(short, long)]
     metadata: bool,
@@ -50,12 +46,6 @@ fn main() -> std::io::Result<()> {
     env_logger::init();
 
     let args = Args::parse();
-
-    // Validate the format parameter
-    if args.format != "json" && args.format != "parquet" {
-        println!("Error: format must be either 'json' or 'parquet'");
-        return Ok(());
-    }
 
     let mut files_to_parse: Vec<String> = Vec::new();
 
