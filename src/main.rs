@@ -86,7 +86,7 @@ fn main() -> std::io::Result<()> {
         // optional metadata output
         let metadata;
         if args.metadata {
-            let metadata_file_path = format!("{}{}_metadata.json", args.prefix, out_file_name);
+            let metadata_file_path = format!("{}_metadata.json", out_file_name);
             metadata = Option::Some(metadata_file_path);
         } else {
             metadata = Option::None;

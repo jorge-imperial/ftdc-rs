@@ -611,7 +611,9 @@ impl FTDCFileDecoder {
     /// # Returns
     ///
     /// * `Result<DataFrame, FileDecoderError>` - A polars DataFrame with columns named after the keys in the hashmap
-    pub fn metrics_to_dataframe(metrics: HashMap<String, Vec<u64>>) -> Result<DataFrame, FileDecoderError> {
+    pub fn metrics_to_dataframe(
+        metrics: HashMap<String, Vec<u64>>,
+    ) -> Result<DataFrame, FileDecoderError> {
         // Create a vector to hold our Series objects
         let mut series_vec: Vec<Series> = Vec::new();
 
