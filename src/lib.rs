@@ -15,12 +15,6 @@ use crate::errors::FileDecoderError;
 
 use polars::prelude::*;
 
-#[derive(Debug, Clone)]
-pub enum OutputFormat {
-    JSON,
-    Parquet,
-}
-
 /// A struct that de codes an FTDC file.
 /// The parsed data should be encapsulated in another struct.
 pub struct FTDCFileDecoder {
@@ -39,33 +33,17 @@ struct MetricData {
     data: Option<[u64; FTDCFileDecoder::MAX_METRICS]>,
 }
 
-pub struct Metric {
-    // pub name: String,
-    pub data: Vec<u64>,
-}
-
 struct RangeCursor {
     buffer: Vec<u8>,
     _size: usize,
     at: usize,
 }
 
-/*
-uint64_t  unpack(ConstDataRangeCursor *cdc) {
-    uint64_t result = 0;
-    uint shift = 0;
-
-    while(true) {
-        uint8_t b = cdc->ReadByte();
-        result |= static_cast<uint64_t>(b & 0x7f) << shift;
-        shift += 7;
-        if ((b & 0x80) == 0) {
-            return result;
-        }
-    }
-}
-*/
-
+/// Unpacks varint deltas
+///
+/// # Arguments
+///
+/// * `data_range_cursor` - A structure that holds the decompressed deltas.
 fn unpack(data_range_cursor: &mut RangeCursor) -> u64 {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
@@ -74,7 +52,6 @@ fn unpack(data_range_cursor: &mut RangeCursor) -> u64 {
         if data_range_cursor.at >= data_range_cursor._size {
             break;
         }
-
         let b = data_range_cursor.buffer[data_range_cursor.at];
         data_range_cursor.at += 1;
 
@@ -96,16 +73,12 @@ impl FTDCFileDecoder {
 
     pub const INITIAL_METRIC_CAPACITY: usize = 10240;
 
-    /// Very unreliable for metric_count
-
+    /// Reads the info on the header of a decompressed data chunk.
+    /// This is not very reliable for metric_count.
     fn read_header(data: &[u8]) -> (usize, usize, usize) {
-        // auto *dataSize = (int32_t*) data;
         //  as *const u32;
         let data_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
 
-        // auto pp = data+(*dataSize);
-        // metricCountFromHeader = *(uint32_t*)pp;
-        // deltaCountFromHeader = *(uint32_t*)(pp + 4);
         let offset: usize = data_size as usize;
         let metric_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         let delta_count = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
@@ -117,9 +90,17 @@ impl FTDCFileDecoder {
         )
     }
 
-    fn inflate_blob(b: &Binary) -> Result<Vec<u8>, InflateDecodeErrors> {
+    /// Inflates/uncompressed a zipped blob.
+    ///
+    /// # Arguments
+    /// * `blob` - A binary BSON document.
+    ///
+    /// # Returns
+    /// A vector of u8 values representing the decompressed blob.
+    ///
+    fn inflate_blob(blob: &Binary) -> Result<Vec<u8>, InflateDecodeErrors> {
         // Get blob
-        let compressed_buffer = b.bytes.as_slice();
+        let compressed_buffer = blob.bytes.as_slice();
         // Compressed buffer. Ignore first 4 bytes.
         let mut decoder = DeflateDecoder::new(&compressed_buffer[4..]);
 
@@ -131,30 +112,12 @@ impl FTDCFileDecoder {
         }
     }
 
-    /// Uncompresses all binary blobs - Single threaded uncompression
-    pub fn uncompress_data_st(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
-        let mut uncompressed_data_vector: Vec<Vec<u8>> =
-            Vec::with_capacity(self.metric_chunks_count);
-
-        //
-        for b in self.binary_chunks.iter() {
-            let blob = FTDCFileDecoder::inflate_blob(b);
-
-            match blob {
-                Ok(encoded_data) => {
-                    // println!( "Uncompressed data: {} -> {}", b.bytes.len(), encoded_data.len() );
-                    uncompressed_data_vector.push(encoded_data);
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-        Ok(uncompressed_data_vector)
-    }
-
-    /// Uncompresses all binary blobs - Multi threaded uncompression
+    /// Uncompresses all binary blobs - threaded uncompression
     ///
+    /// # Arguments
+    ///
+    /// # Returns
+    /// * A vector of vectors of u8, representing the uncompressed deltas block.
     pub fn uncompress_data(&self) -> Result<Vec<Vec<u8>>, InflateDecodeErrors> {
         let uncompressed_data_vector = Arc::new(Mutex::new(vec![]));
         let binary_chunks_x = Arc::new(self.binary_chunks.clone());
@@ -190,27 +153,15 @@ impl FTDCFileDecoder {
         Ok(uncompressed_data_vector.lock().unwrap().clone())
     }
 
-    /// Returns a valid JSON with metric names and initial value.
-    ///
-    pub fn get_metric_names_json(buffer: &Vec<u8>) -> Result<String, String> {
-        let mut base = buffer.as_slice();
-        // The document has
-        let bson_doc = Document::from_reader(&mut base);
-        if bson_doc.is_err() {
-            return Err(bson_doc.err().unwrap().to_string());
-        }
-        // convert to json
-        let json_value = Bson::Document(bson_doc.unwrap());
-
-        let json_str = serde_json::to_string_pretty(&json_value);
-        if json_str.is_err() {
-            return Err(json_str.unwrap_err().to_string());
-        }
-        Ok(json_str.unwrap())
-    }
-
     /// Reads sub-docs from the original BSON doc recursively.
-    /// This is a bad name for the function.
+    ///  Auxiliar to `extract_metric_meta_data`
+    ///
+    /// # Arguments:
+    /// * `doc_name` - A str reference with the name of the parent BSON document.
+    /// * `metric_data` - A mutable reference to a Vector of MetricData
+    ///
+    /// # Returns
+    /// * Metric data structures are appended/pushed into the `metric_data` vector.
     fn extract_metric_data_from_doc(
         doc_name: &str,
         root: Document,
@@ -331,6 +282,16 @@ impl FTDCFileDecoder {
         }
     }
 
+    /// Extracts the names of the metrics and their count, as the data in the header is not reliable*
+    ///
+    /// # Arguments
+    ///
+    /// *  `buffer` - The decompressed data block, that is cast to d BSON Document.
+    ///
+    /// # Returns
+    ///
+    /// * A vector of `MetricData`
+    ///
     fn extract_metric_meta_data(buffer: &Vec<u8>) -> Result<Vec<MetricData>, FileDecoderError> {
         let mut base = buffer.as_slice();
 
@@ -348,11 +309,20 @@ impl FTDCFileDecoder {
         }
     }
 
+    /// Extract metric values from decompressed Metric data as varint deltas added to an initial value.
+    ///
+    /// # Arguments
+    ///
+    /// * - `metric_data_vec` -  A vector of MetricData where the uncompressed data is.
+    ///
+    /// # Returns
+    ///
+    ///  A count of how many values were found. The actual values are stored in the `metric_data_vec`
     fn extract_all_metrics_from_buffer<'a>(
         metric_data_vec: &mut Vec<MetricData>,
         buffer: &Vec<u8>,
     ) -> Result<usize, FileDecoderError> {
-        let (doc_size, _y, delta_count_from_header) =
+        let (doc_size, _, delta_count_from_header) =
             FTDCFileDecoder::read_header(buffer.as_slice());
 
         let offset = doc_size + 8;
@@ -409,6 +379,12 @@ impl FTDCFileDecoder {
         Ok(count)
     }
 
+    /// Creates a new structure to decode a single file
+    ///
+    /// # Arguments
+    ///
+    /// # Returns
+    /// A clean `FTDCFileDecoder` structure.
     pub fn new() -> FTDCFileDecoder {
         FTDCFileDecoder {
             metadata: "".to_string(),
@@ -417,6 +393,17 @@ impl FTDCFileDecoder {
             binary_chunks: vec![],
         }
     }
+
+    /// Reads an FTDC metrics file, storing the BSON documents in the structure.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name` - The file to read
+    ///
+    /// # Returns
+    ///
+    /// * An empty ()
+    ///
     pub fn read_file(&mut self, file_name: &str) -> Result<(), FileDecoderError> {
         // Open file, get buffed_reader
         match buffered_reader::File::open(file_name) {
@@ -502,6 +489,16 @@ impl FTDCFileDecoder {
         Ok(())
     }
 
+    /// Reads an FTDC file and decompresses the data bearing documents in it.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name` - The name of the file to read.
+    ///
+    /// # Returns
+    ///
+    /// * A vector of vectors of U8 values.
+    ///
     pub fn read_and_uncompress(
         &mut self,
         file_name: &str,
@@ -518,7 +515,17 @@ impl FTDCFileDecoder {
         }
     }
 
-    pub fn decode_data(
+    /// Decodes data in chunks that have been decompressed. Processing for each chunk is done
+    /// in a separate thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `data_chunks` - A vector of pre-decompressed chunks
+    ///
+    /// # Returns
+    /// * A hashmap with metric names as String, and a vector of U64 values.
+    ///
+    pub fn decode_decompressed_data_chunks(
         &self,
         data_chunks: Vec<Vec<u8>>,
     ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
@@ -588,7 +595,16 @@ impl FTDCFileDecoder {
         Ok(metric_data_arc.lock().unwrap().clone())
     }
 
-    /// Will read a file, uncompress chunks and decode deltas.
+    /// Reads an FTDC file, uncompresses binary docs contained in it and decodes deltas.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name` -  The name of the file to decode.
+    ///
+    /// # Returns
+    ///
+    /// * A hashmap of the metric name and a vector of U64 values.
+    ///
     pub fn read_and_decode(
         &mut self,
         file_name: &str,
@@ -597,7 +613,7 @@ impl FTDCFileDecoder {
 
         let data_chunks = self.read_and_uncompress(file_name)?;
 
-        let decoded_data = self.decode_data(data_chunks)?;
+        let decoded_data = self.decode_decompressed_data_chunks(data_chunks)?;
 
         Ok(decoded_data)
     }
@@ -605,11 +621,9 @@ impl FTDCFileDecoder {
     /// Converts a HashMap<String, Vec<u64>> to a polars DataFrame
     ///
     /// # Arguments
-    ///
     /// * `metrics` - A HashMap where keys are metric names and values are vectors of u64 values
     ///
     /// # Returns
-    ///
     /// * `Result<DataFrame, FileDecoderError>` - A polars DataFrame with columns named after the keys in the hashmap
     pub fn metrics_to_dataframe(
         metrics: HashMap<String, Vec<u64>>,
@@ -639,10 +653,20 @@ impl FTDCFileDecoder {
         Ok(DataFrame::from_iter(series_vec))
     }
 
+    /// Decodes an FTDC file and writes a Parquet file with the information.
+    ///
+    /// # Arguments
+    ///
+    /// * `input_file_name` - The name of the FTDC file to decode.
+    /// * `output_file_name` - The name of the file to write parquet data.
+    /// * `metadata` - An Option<&str> that if not None will be used to write metadata.
+    /// # Returns
+    ///
+    /// * `Result<(), FileDecoderError>` - Nothing
     pub fn write_to_parquet(
         input_file_name: &str,
         output_file_name: &str,
-        metadata: Option<String>,
+        metadata: Option<&str>,
     ) -> Result<(), FileDecoderError> {
         let mut parsed_file = FTDCFileDecoder::new();
 
@@ -659,6 +683,7 @@ impl FTDCFileDecoder {
             .finish(&mut df)
             .map_err(|e| FileDecoderError::Other(anyhow!("Failed to write parquet file: {}", e)))?;
 
+        // Write metadata
         if let Some(metadata_file) = metadata {
             // Create entry
             let metric_names: Vec<String> = df
@@ -672,7 +697,8 @@ impl FTDCFileDecoder {
                 "metadata": parsed_file.metadata,
                 "parameters":parsed_file.parameters,
                 "chunks_in_file": parsed_file.metric_chunks_count,
-                "metrics": metric_names
+                "metrics": metric_names,
+
             });
 
             // Write the JSON string to the specified file
@@ -684,6 +710,7 @@ impl FTDCFileDecoder {
                 FileDecoderError::Other(anyhow!("Failed to write metadata file: {}", e))
             })?;
         }
+
         Ok(())
     }
 }
