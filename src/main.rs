@@ -75,11 +75,12 @@ fn main() -> std::io::Result<()> {
 
         // optional metadata output
         let metadata;
+        let metadata_file_path: String;
         if args.metadata {
-            let metadata_file_path = format!("{}_metadata.json", out_file_name);
-            metadata = Option::Some(metadata_file_path);
+            metadata_file_path = format!("{}_metadata.json", out_file_name);
+            metadata = Some(metadata_file_path.as_str());
         } else {
-            metadata = Option::None;
+            metadata = None;
         }
 
         match FTDCFileDecoder::write_to_parquet(&*file_name, &*out_file_name, metadata) {
