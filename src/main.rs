@@ -1,28 +1,33 @@
 use clap::Parser;
-use ftdc::FTDCFileDecoder;
+use regex::Regex;
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
+use ftdc_rs::FTDCFileDecoder;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-#[command(version, about, long_about = None)]
+//#[command(version, about, long_about = None)]
 struct Args {
     /// Path to file(s) to convert.
     #[arg(short, long)]
     path: String,
 
     /// Path where the output files will be written.
-    #[arg(long, default_value = "./")]
-    prefix: String,
+    #[arg(short, long, default_value = "./")]
+    output_path: String,
 
     /// Display additional information
-    #[arg(short, long)]
+    #[arg(short, long, required = false)]
     info: bool,
 
     /// Write the metrics in the file(s) to a JSON
-    #[arg(short, long)]
+    #[arg(short, long, required = false)]
     metadata: bool,
+
+    ///  Filter metrics
+    #[arg(short,long, default_value = None, required = false)]
+    filter: Option<String>,
 }
 
 /// Displays additional information about a file when the info parameter is true
@@ -60,6 +65,20 @@ fn main() -> std::io::Result<()> {
         files_to_parse.push(path_directory.display().to_string());
     }
 
+    // Check if there is a filter
+    let mut filter: Option<Regex> = None;
+    if args.filter.is_some() {
+        let filter_str = args.filter.unwrap();
+
+        match Regex::new(filter_str.as_str()) {
+            Ok(r) => filter = Some(r),
+            Err(e) => {
+                println!("Error parsing regular expression {}: {}", filter_str, e);
+                return Ok(());
+            }
+        }
+    }
+
     for file_name in files_to_parse {
         // Display additional information if info parameter is true
         if args.info {
@@ -68,8 +87,8 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        let full_path = Path::new(&file_name).file_name().unwrap().to_str().unwrap();
-        let out_file_name = format!("{}{}.parquet", args.prefix, full_path);
+        let full_path = Path::new(&file_name).file_name().unwrap().to_str().unwrap(); // <- living dangerously
+        let out_file_name = format!("{}{}.parquet", args.output_path, full_path);
 
         println!("Processing {file_name} -> {out_file_name}");
 
@@ -83,7 +102,12 @@ fn main() -> std::io::Result<()> {
             metadata = None;
         }
 
-        match FTDCFileDecoder::write_to_parquet(&*file_name, &*out_file_name, metadata) {
+        match FTDCFileDecoder::write_to_parquet(
+            file_name.as_str(),
+            out_file_name.as_str(),
+            metadata,
+            filter.clone(),
+        ) {
             Ok(_) => {
                 println!("Successfully written to {}", out_file_name);
             }

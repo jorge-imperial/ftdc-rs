@@ -1,19 +1,18 @@
 extern crate core;
 mod errors;
 
+use crate::errors::FileDecoderError;
 use anyhow::anyhow;
 use bson::{Binary, Bson, Document};
 use buffered_reader;
 use buffered_reader::BufferedReader;
+use polars::prelude::*;
+use regex::Regex;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use zune_inflate::DeflateDecoder;
 use zune_inflate::errors::{DecodeErrorStatus, InflateDecodeErrors};
-
-use crate::errors::FileDecoderError;
-
-use polars::prelude::*;
 
 /// A struct that de codes an FTDC file.
 /// The parsed data should be encapsulated in another struct.
@@ -608,14 +607,24 @@ impl FTDCFileDecoder {
     pub fn read_and_decode(
         &mut self,
         file_name: &str,
+        filter: Option<Regex>,
     ) -> Result<HashMap<String, Vec<u64>>, FileDecoderError> {
-        //let mut out: HashMap<String, Vec<u64>> = HashMap::new();
-
         let data_chunks = self.read_and_uncompress(file_name)?;
-
         let decoded_data = self.decode_decompressed_data_chunks(data_chunks)?;
 
-        Ok(decoded_data)
+        match filter {
+            Some(re) => {
+                let mut matched_data: HashMap<String, Vec<u64>> = HashMap::new();
+
+                for (key, value) in decoded_data {
+                    if re.is_match(&key) {
+                        matched_data.insert(key, value);
+                    }
+                }
+                Ok(matched_data)
+            }
+            None => Ok(decoded_data),
+        }
     }
 
     /// Converts a HashMap<String, Vec<u64>> to a polars DataFrame
@@ -667,10 +676,11 @@ impl FTDCFileDecoder {
         input_file_name: &str,
         output_file_name: &str,
         metadata: Option<&str>,
+        filter: Option<Regex>,
     ) -> Result<(), FileDecoderError> {
         let mut parsed_file = FTDCFileDecoder::new();
 
-        let metrics = parsed_file.read_and_decode(input_file_name)?;
+        let metrics = parsed_file.read_and_decode(input_file_name, filter)?;
 
         // Convert the metrics hashmap to a DataFrame
         let mut df = Self::metrics_to_dataframe(metrics)?;
@@ -836,7 +846,7 @@ mod tests {
     #[test]
     fn test_get_metric_data_decoded() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
-        let data_vec = parsed_file.read_and_decode(TEST_FILE_PATH).unwrap();
+        let data_vec = parsed_file.read_and_decode(TEST_FILE_PATH, None).unwrap();
 
         data_vec.iter().for_each(|x| {
             println!("{}", x.0);
