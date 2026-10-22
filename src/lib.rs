@@ -14,12 +14,50 @@ use std::thread;
 use zune_inflate::DeflateDecoder;
 use zune_inflate::errors::{DecodeErrorStatus, InflateDecodeErrors};
 
-/// A struct that de codes an FTDC file.
-/// The parsed data should be encapsulated in another struct.
+/// `type` values on the BSON documents concatenated inside an FTDC archive.
+///
+/// An archive (`metrics.<utc>-<uniquifier>`, or `metrics.interim`) is not one
+/// BSON document. It is a sequence of them. `bsondump` shows each one. The
+/// `type` field says which kind of payload follows:
+///
+/// * `0` — metadata, written when the file is opened. The payload is `doc`
+///   and describes the host and the collectors. There is normally one.
+/// * `1` — a metric chunk. The payload is `data`, a BinData blob: a `uint32`
+///   uncompressed length, then a zlib stream of deltas. This is the only
+///   type that carries the time series.
+/// * `2` — a periodic metadata delta. MongoDB 7 and later write these for
+///   slow-changing values such as server parameters. The payload is `doc`
+///   plus a `count`. A metrics file usually has one of these *before* the
+///   first metric chunk. They are not samples and they are not a reason to
+///   stop reading.
+///
+/// The server has grown this set before (`2` itself was the addition). A
+/// type this build does not know is skipped and remembered, so metric chunks
+/// that follow it are still decoded.
+const TYPE_METADATA: i32 = 0;
+const TYPE_METRIC_CHUNK: i32 = 1;
+const TYPE_METADATA_DELTA: i32 = 2;
+
+/// A struct that decodes an FTDC file.
+///
+/// The compressed metric blobs live here until [`FTDCFileDecoder::uncompress_data`]
+/// inflates them. Metadata documents are kept whole so a later export can
+/// write them as JSON without parsing `Document`'s `Display` text back apart.
 pub struct FTDCFileDecoder {
-    metadata: String,
-    parameters: String,
-    metric_chunks_count: usize,
+    /// Type 0 `doc` sub-documents, in file order.
+    metadata_docs: Vec<Document>,
+    /// Type 2 `doc` sub-documents, in file order.
+    ///
+    /// The old field name for this was `parameters`. Type 2 is a metadata
+    /// delta, not the startup parameter block. Several of them can appear
+    /// in one file; keeping only the last one drops the earlier samples.
+    metadata_deltas: Vec<Document>,
+    /// BSON documents visited while reading, of every type, including
+    /// types that were skipped.
+    document_count: usize,
+    /// `type` numbers this build did not recognise. Reading continued.
+    skipped_chunk_types: Vec<i32>,
+    /// Type 1 `data` blobs, still compressed, in file order.
     binary_chunks: Vec<Binary>,
 }
 
@@ -65,9 +103,6 @@ fn unpack(data_range_cursor: &mut RangeCursor) -> u64 {
 }
 
 impl FTDCFileDecoder {
-    const METADATA: i32 = 0;
-    const METRICS: i32 = 1;
-    const PARAMETERS: i32 = 2;
     pub const MAX_METRICS: usize = 300;
 
     pub const INITIAL_METRIC_CAPACITY: usize = 10240;
@@ -386,9 +421,10 @@ impl FTDCFileDecoder {
     /// A clean `FTDCFileDecoder` structure.
     pub fn new() -> FTDCFileDecoder {
         FTDCFileDecoder {
-            metadata: "".to_string(),
-            parameters: "".to_string(),
-            metric_chunks_count: 0,
+            metadata_docs: Vec::new(),
+            metadata_deltas: Vec::new(),
+            document_count: 0,
+            skipped_chunk_types: Vec::new(),
             binary_chunks: vec![],
         }
     }
@@ -413,60 +449,40 @@ impl FTDCFileDecoder {
                     match Document::from_reader(&mut reader) {
                         // If it can be read...
                         Ok(metrics) => {
-                            if let Some(chunk_type) = metrics.get("type") {
-                                // println!("Chunk type: {}", chunk_type);
-                                match chunk_type.as_i32().unwrap() {
-                                    FTDCFileDecoder::METADATA => {
-                                        // Doc key is a JSON structure with the host's information.
-                                        match metrics.get("doc") {
-                                            Some(doc) => {
-                                                self.metadata = doc.to_string();
-                                            }
-                                            _ => {
-                                                //println!("'doc' type not found");
-                                                return Err(FileDecoderError::Other(anyhow!(
-                                                    "'doc' key not found in METADATA chunk. "
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    FTDCFileDecoder::METRICS => {
-                                        if metrics.contains_key("data") {
-                                            if let Bson::Binary(b) = metrics.get("data").unwrap() {
-                                                self.binary_chunks.push(b.clone());
-                                            }
-                                        } else {
-                                            //println!("'data' type not found");
-                                            return Err(FileDecoderError::Other(anyhow!(
-                                                "'data' key not found in METRICS chunk. "
-                                            )));
-                                        }
-                                    }
-                                    FTDCFileDecoder::PARAMETERS => {
-                                        // Doc key is a JSON structure with the host's information.
-                                        match metrics.get("doc") {
-                                            Some(doc) => {
-                                                self.parameters = doc.to_string();
-                                            }
-                                            _ => {
-                                                //println!("doc type not found");
-                                                return Err(FileDecoderError::Other(anyhow!(
-                                                    "'doc' key not found in PARAMETERS chunk. "
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        return Err(FileDecoderError::Other(anyhow!(
-                                            "Unknown BSON doc type {chunk_type:?}"
-                                        )));
-                                    }
+                            // Count this document even when we skip it, so
+                            // `document_count` describes the file rather than
+                            // only the documents we knew how to use.
+                            self.document_count += 1;
+                            match chunk_type_of(&metrics)? {
+                                TYPE_METADATA => {
+                                    self.metadata_docs
+                                        .push(embedded_doc(&metrics, "doc", "metadata")?);
                                 }
-                            } else {
-                                println!("'type' not found");
-                                return Err(FileDecoderError::Other(anyhow!(
-                                    "'type' key not found in chunk. "
-                                )));
+                                TYPE_METRIC_CHUNK => {
+                                    self.binary_chunks.push(metric_blob(&metrics)?);
+                                }
+                                TYPE_METADATA_DELTA => {
+                                    // Keep every delta. A file from MongoDB 7+
+                                    // has one of these before the first metric
+                                    // chunk, and a long-running process appends
+                                    // more as parameters change. Replacing the
+                                    // previous value would leave only the last.
+                                    self.metadata_deltas.push(embedded_doc(
+                                        &metrics,
+                                        "doc",
+                                        "metadata delta",
+                                    )?);
+                                }
+                                other => {
+                                    // Do not abort. The metric chunks after an
+                                    // unknown type are still valid samples, and
+                                    // failing here is how a whole archive used
+                                    // to be discarded because of one document.
+                                    log::warn!(
+                                        "skipping unrecognised FTDC chunk type {other}; metric chunks around it are still read"
+                                    );
+                                    self.skipped_chunk_types.push(other);
+                                }
                             }
                         }
                         Err(e) => {
@@ -476,7 +492,6 @@ impl FTDCFileDecoder {
                             break;
                         }
                     }
-                    self.metric_chunks_count += 1;
                 }
             }
             Err(e) => {
@@ -703,10 +718,24 @@ impl FTDCFileDecoder {
                 .collect();
 
             // Convert the Metadata struct to a JSON string
+            // The sidecar still stores one string per group. The reader
+            // keeps every document; the export that writes them as a JSON
+            // array lands with the CLI changes. `Document`'s `Display` is
+            // what the previous field stored, so the same text is kept here.
+            let metadata = parsed_file
+                .metadata_docs
+                .last()
+                .map(|doc| doc.to_string())
+                .unwrap_or_default();
+            let parameters = parsed_file
+                .metadata_deltas
+                .last()
+                .map(|doc| doc.to_string())
+                .unwrap_or_default();
             let json_data = serde_json::json!({
-                "metadata": parsed_file.metadata,
-                "parameters":parsed_file.parameters,
-                "chunks_in_file": parsed_file.metric_chunks_count,
+                "metadata": metadata,
+                "parameters": parameters,
+                "chunks_in_file": parsed_file.document_count,
                 "metrics": metric_names,
 
             });
@@ -722,6 +751,60 @@ impl FTDCFileDecoder {
         }
 
         Ok(())
+    }
+}
+
+/// Read the chunk `type` without panicking when it is missing or not an int.
+///
+/// The server writes it with `appendNumber`, which is an int32 for these
+/// small values. int64 is accepted too, because a permissive writer (and
+/// some round-trips through extended JSON) will widen it.
+fn chunk_type_of(doc: &Document) -> Result<i32, FileDecoderError> {
+    match doc.get("type") {
+        Some(Bson::Int32(value)) => Ok(*value),
+        Some(Bson::Int64(value)) => i32::try_from(*value).map_err(|_| {
+            FileDecoderError::Other(anyhow!("FTDC chunk type {value} does not fit in an int32"))
+        }),
+        Some(other) => Err(FileDecoderError::Other(anyhow!(
+            "FTDC chunk type is {other:?}, expected an int"
+        ))),
+        None => Err(FileDecoderError::Other(anyhow!(
+            "'type' key not found in chunk"
+        ))),
+    }
+}
+
+/// Take the embedded document stored under `key`.
+///
+/// Type 0 and type 2 both keep their payload in `doc`. A chunk that claims
+/// to be one of those and has no document is corrupt; unlike an unknown
+/// type number, there is nothing sensible to skip to.
+fn embedded_doc(doc: &Document, key: &str, kind: &str) -> Result<Document, FileDecoderError> {
+    match doc.get(key) {
+        Some(Bson::Document(inner)) => Ok(inner.clone()),
+        Some(other) => Err(FileDecoderError::Other(anyhow!(
+            "'{key}' in an FTDC {kind} chunk is {other:?}, expected a document"
+        ))),
+        None => Err(FileDecoderError::Other(anyhow!(
+            "'{key}' key not found in an FTDC {kind} chunk"
+        ))),
+    }
+}
+
+/// Take the compressed blob from a type 1 chunk.
+///
+/// A metric chunk whose `data` is not BinData used to be ignored, which
+/// deleted a block of samples and shifted every later timestamp. That is a
+/// broken file, so it is reported.
+fn metric_blob(doc: &Document) -> Result<Binary, FileDecoderError> {
+    match doc.get("data") {
+        Some(Bson::Binary(blob)) => Ok(blob.clone()),
+        Some(other) => Err(FileDecoderError::Other(anyhow!(
+            "'data' in an FTDC metric chunk is {other:?}, expected BinData"
+        ))),
+        None => Err(FileDecoderError::Other(anyhow!(
+            "'data' key not found in an FTDC metric chunk"
+        ))),
     }
 }
 
@@ -755,13 +838,72 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_should_read_5_chunks() {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
-        assert_eq!(parsed_file.metric_chunks_count, 213);
+        assert_eq!(parsed_file.document_count, 213);
+    }
+
+    /// A MongoDB 7+ archive starts with metadata, then a type 2 delta,
+    /// and only then the metric chunks. An unknown type must not end
+    /// the read, and a second delta must not replace the first.
+    #[test]
+    fn type2_and_unknown_types_do_not_abort_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("ftdc-rs-chunk-types-{}.bin", std::process::id()));
+        let mut bytes = Vec::new();
+        let documents = [
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(0),
+                "type": 0i32,
+                "doc": { "host": "a.example" }
+            },
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(1),
+                "type": 2i32,
+                "count": 0i32,
+                "doc": { "param": 1i32 }
+            },
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(2),
+                "type": 9i32,
+                "doc": { "future": true }
+            },
+            bson::doc! {
+                "_id": bson::DateTime::from_millis(3),
+                "type": 2i32,
+                "count": 1i32,
+                "doc": { "param": 2i32 }
+            },
+        ];
+        for document in &documents {
+            document.to_writer(&mut bytes).unwrap();
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut parsed_file = FTDCFileDecoder::new();
+        parsed_file
+            .read_file(path.to_str().unwrap())
+            .expect("type 2 and an unknown type are not fatal");
+
+        assert_eq!(parsed_file.metadata_docs.len(), 1);
+        assert_eq!(
+            parsed_file.metadata_docs[0].get_str("host").unwrap(),
+            "a.example"
+        );
+        assert_eq!(parsed_file.metadata_deltas.len(), 2);
+        assert_eq!(parsed_file.metadata_deltas[0].get_i32("param").unwrap(), 1);
+        assert_eq!(parsed_file.metadata_deltas[1].get_i32("param").unwrap(), 2);
+        assert_eq!(parsed_file.skipped_chunk_types, vec![9]);
+        assert_eq!(parsed_file.document_count, 4);
+        assert!(parsed_file.binary_chunks.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_inflate_chunks() {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
@@ -782,6 +924,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn get_metric_meta_data() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
@@ -807,6 +950,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_metric_deltas() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
         parsed_file.read_file(TEST_FILE_PATH).unwrap();
@@ -844,6 +988,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixture diagnostic.data.8.0.11 is not in the repository"]
     fn test_get_metric_data_decoded() -> () {
         let mut parsed_file = FTDCFileDecoder::new();
         let data_vec = parsed_file.read_and_decode(TEST_FILE_PATH, None).unwrap();
