@@ -1,38 +1,101 @@
 use clap::Parser;
+use ftdc_rs::Archive;
 use regex::Regex;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::SystemTime;
-use ftdc_rs::FTDCFileDecoder;
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-//#[command(version, about, long_about = None)]
+#[command(
+    about = "Convert MongoDB FTDC diagnostic archives to Parquet",
+    long_about = None
+)]
 struct Args {
-    /// Path to file(s) to convert.
+    /// FTDC metrics file, or a directory of them.
+    ///
+    /// A directory is scanned for files whose names start with `metrics.`
+    /// (`metrics.interim`, `metrics.<utc>-<seq>`). Other names are left
+    /// alone. The matches are processed in name order. A path that is not
+    /// a directory is that one file, whatever it is called.
     #[arg(short, long)]
-    path: String,
+    path: PathBuf,
 
-    /// Path where the output files will be written.
+    /// Directory the Parquet files are written into.
     #[arg(short, long, default_value = "./")]
-    output_path: String,
+    output_path: PathBuf,
 
-    /// Display additional information
-    #[arg(short, long, required = false)]
+    /// Print the size and modification time of each input.
+    #[arg(short, long)]
     info: bool,
 
-    /// Write the metrics in the file(s) to a JSON
-    #[arg(short, long, required = false)]
+    /// Also write `<name>.metadata.json` next to each Parquet file.
+    ///
+    /// The sidecar is relaxed extended JSON: every type 0 wrapper
+    /// (`_id` and `doc`) and every type 2 wrapper (`_id`, `count`, and
+    /// `doc`), in file order.
+    #[arg(short, long)]
     metadata: bool,
 
-    ///  Filter metrics
-    #[arg(short,long, default_value = None, required = false)]
+    /// Keep metrics whose name matches this regular expression.
+    #[arg(short, long)]
     filter: Option<String>,
 }
 
-/// Displays additional information about a file when the info parameter is true
-fn display_file_info(file_path: &str) -> std::io::Result<()> {
-    println!("File: {}", file_path);
+/// Files this invocation will decode.
+///
+/// Directory entries are filtered to `metrics.*` and sorted. Anything that
+/// is not a regular file (a subdirectory, a symlink to a directory) is
+/// skipped. Diagnostic directories contain those, and they are not archives.
+fn files_to_read(path: &Path) -> io::Result<Vec<PathBuf>> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let candidate = entry.path();
+        if !candidate.is_file() {
+            continue;
+        }
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("metrics.") {
+            files.push(candidate);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// `<output>/<file>.parquet` for an input path.
+///
+/// `Path::join` inserts the separator. Concatenating the directory string
+/// with the file name turned `--output-path ./out` into `./outmetrics...`.
+fn parquet_output(dir: &Path, input: &Path) -> Option<PathBuf> {
+    let name = input.file_name()?.to_str()?;
+    Some(dir.join(format!("{name}.parquet")))
+}
+
+/// `<output>/<file>.metadata.json`, beside the Parquet file.
+///
+/// The previous name was `<file>.parquet_metadata.json`, glued onto the
+/// Parquet path. The sidecar describes the archive, so it shares the
+/// archive's name and uses a `.metadata.json` suffix.
+fn metadata_output(parquet: &Path) -> PathBuf {
+    let name = parquet
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("metrics.parquet");
+    let stem = name.strip_suffix(".parquet").unwrap_or(name);
+    parquet.with_file_name(format!("{stem}.metadata.json"))
+}
+
+fn display_file_info(file_path: &Path) -> io::Result<()> {
+    println!("File: {}", file_path.display());
 
     let metadata = fs::metadata(file_path)?;
     println!("Size: {} bytes", metadata.len());
@@ -47,75 +110,125 @@ fn display_file_info(file_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() -> std::io::Result<()> {
-    env_logger::init();
+fn main() -> ExitCode {
+    // `warn` is the default so a skipped chunk type is visible without
+    // RUST_LOG. `error` is a file that failed. A set RUST_LOG still wins.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let args = Args::parse();
 
-    let mut files_to_parse: Vec<String> = Vec::new();
-
-    // Is this a directory?
-    let path_directory = Path::new(&args.path);
-    if path_directory.is_dir() {
-        for entry in fs::read_dir(path_directory)? {
-            let entry = entry?;
-            files_to_parse.push(entry.path().display().to_string());
+    let files = match files_to_read(&args.path) {
+        Ok(files) => files,
+        Err(error) => {
+            log::error!("failed to read {}: {error}", args.path.display());
+            return ExitCode::FAILURE;
         }
+    };
+    if files.is_empty() {
+        log::error!("no metrics.* files in {}", args.path.display());
+        return ExitCode::FAILURE;
+    }
+
+    let filter = match args.filter.as_deref().map(Regex::new).transpose() {
+        Ok(filter) => filter,
+        Err(error) => {
+            log::error!(
+                "invalid --filter {}: {error}",
+                args.filter.as_deref().unwrap_or("")
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut failed = false;
+    for file_name in &files {
+        if args.info
+            && let Err(error) = display_file_info(file_name)
+        {
+            log::error!("{error}");
+            failed = true;
+        }
+
+        let Some(out_file) = parquet_output(&args.output_path, file_name) else {
+            log::error!("input path {} has no UTF-8 file name", file_name.display());
+            failed = true;
+            continue;
+        };
+        let metadata = args.metadata.then(|| metadata_output(&out_file));
+
+        println!(
+            "Processing {} -> {}",
+            file_name.display(),
+            out_file.display()
+        );
+
+        match Archive::write_to_parquet(file_name, &out_file, metadata.as_deref(), |name| {
+            filter
+                .as_ref()
+                .map(|expression| expression.is_match(name))
+                .unwrap_or(true)
+        }) {
+            Ok(()) => println!("Successfully written to {}", out_file.display()),
+            Err(error) => {
+                log::error!("failed to write {}: {error}", out_file.display());
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        ExitCode::FAILURE
     } else {
-        files_to_parse.push(path_directory.display().to_string());
+        ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{files_to_read, metadata_output, parquet_output};
+    use std::path::Path;
+
+    #[test]
+    fn directory_scan_keeps_metrics_files_in_name_order() {
+        let dir = std::env::temp_dir().join(format!("ftdc-rs-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("metrics.b"), b"").unwrap();
+        std::fs::write(dir.join("metrics.a"), b"").unwrap();
+        std::fs::write(dir.join("metrics.interim"), b"").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"").unwrap();
+        std::fs::create_dir(dir.join("nested")).unwrap();
+
+        let files = files_to_read(&dir).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "metrics.a".to_string(),
+                "metrics.b".to_string(),
+                "metrics.interim".to_string()
+            ]
+        );
+
+        // A path to one file is that file, even when the name would be
+        // skipped inside a directory scan.
+        let one = files_to_read(&dir.join("notes.txt")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].file_name().unwrap(), "notes.txt");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Check if there is a filter
-    let mut filter: Option<Regex> = None;
-    if args.filter.is_some() {
-        let filter_str = args.filter.unwrap();
-
-        match Regex::new(filter_str.as_str()) {
-            Ok(r) => filter = Some(r),
-            Err(e) => {
-                println!("Error parsing regular expression {}: {}", filter_str, e);
-                return Ok(());
-            }
-        }
+    #[test]
+    fn output_paths_join_the_directory_and_use_a_metadata_suffix() {
+        let parquet = parquet_output(Path::new("out"), Path::new("diag/metrics.interim")).unwrap();
+        assert_eq!(parquet, Path::new("out/metrics.interim.parquet"));
+        assert_eq!(
+            metadata_output(&parquet),
+            Path::new("out/metrics.interim.metadata.json")
+        );
     }
-
-    for file_name in files_to_parse {
-        // Display additional information if info parameter is true
-        if args.info {
-            if let Err(e) = display_file_info(&file_name) {
-                println!("Error displaying file info: {}", e);
-            }
-        }
-
-        let full_path = Path::new(&file_name).file_name().unwrap().to_str().unwrap(); // <- living dangerously
-        let out_file_name = format!("{}{}.parquet", args.output_path, full_path);
-
-        println!("Processing {file_name} -> {out_file_name}");
-
-        // optional metadata output
-        let metadata;
-        let metadata_file_path: String;
-        if args.metadata {
-            metadata_file_path = format!("{}_metadata.json", out_file_name);
-            metadata = Some(metadata_file_path.as_str());
-        } else {
-            metadata = None;
-        }
-
-        match FTDCFileDecoder::write_to_parquet(
-            file_name.as_str(),
-            out_file_name.as_str(),
-            metadata,
-            filter.clone(),
-        ) {
-            Ok(_) => {
-                println!("Successfully written to {}", out_file_name);
-            }
-            Err(_e) => {
-                println!("Failed to write to {}", out_file_name);
-            }
-        }
-    }
-
-    Ok(())
 }
